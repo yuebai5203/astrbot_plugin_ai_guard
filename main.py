@@ -144,8 +144,10 @@ class Main(Star):
         if key in self._judging:
             logger.debug(f"AI守卫: {key} 正在判断中，放行本轮")
             return
-        # 冷却期内复用上次判定结果（不重复调 LLM，但行为保持一致）
-        # 全量判断：对话中消息（@AI/提AI/唤醒词/回复窗口/私聊）都过 LLM，统一走 judge 冷却
+        # 词库未命中：不占守卫判断资源，交给对话 LLM 的函数工具（ai_guard_report）自行判断上报
+        if not hit:
+            return
+        # 词库命中必查：冷却期内复用上次判定结果（不重复调 LLM，但行为保持一致）
         verdict = None
         if not self._is_focus(key):
             in_cd = self._in_judge_cd(key) or self._in_cooldown(key)
@@ -157,7 +159,7 @@ class Main(Star):
                     logger.debug(f"AI守卫: {key} 冷却中且无缓存，放行本轮")
                     return
         if verdict is None:
-            logger.info(f"AI守卫: LLM 判断 ({key}) text={text[:30]}")
+            logger.info(f"AI守卫: 词库命中，LLM 判断 ({key}) text={text[:30]}")
             self._judging.add(key)
             verdict = await self._judge(event, key)
         if not verdict:
@@ -403,6 +405,46 @@ class Main(Star):
             return False
         low = key.lower()
         return any(f.lower() in low for f in focus if f)
+
+    # ---------- 函数工具（对话 LLM 调用） ----------
+
+    @filter.llm_tool(name="ai_guard_report")
+    async def ai_guard_report(self, event: AstrMessageEvent, severity: int, reason: str) -> str:
+        """当你觉得用户正在辱骂你、阴阳怪气你或恶意攻击你时，调用此工具向管理员举报，管理员会收到你们的完整聊天记录并决定是否拉黑对方。
+
+        攻击强度（0-10）判断标准：
+        0-2 玩笑、玩梗、好友互喷，不算攻击，不要调用；
+        3-4 认真不满、阴阳怪气、轻度吐槽；
+        5-6 明确人身攻击、脏话，认真在骂；
+        7-8 持续辱骂、反复贬低、严重人身攻击；
+        9-10 极端恶劣、刷屏攻击、威胁、人肉。
+        注意：只有攻击对象是你（AI/bot）本人才算，用户骂其他人（群友互喷）不要调用。
+
+        Args:
+            severity(number): 攻击强度 0-10
+            reason(string): 攻击原因，一句话说明
+        """
+        try:
+            key = self._session_key(event)
+            try:
+                severity = max(0, min(10, int(round(float(severity)))))
+            except (TypeError, ValueError):
+                severity = 4
+            threshold = self._threshold_for(key)
+            if severity < threshold:
+                return f"攻击强度 {severity} 未达上报阈值 {threshold}，暂不上报。"
+            if self._in_cooldown(key):
+                return "该会话近期已上报过，冷却期内不重复上报。"
+            context = self._get_context(key)
+            attacker_id = str(event.get_sender_id() or "")
+            self._stats["tool_calls"] = self._stats.get("tool_calls", 0) + 1
+            await self._report(
+                event, key, context, severity, reason or "无", attacker_id
+            )
+            return f"已上报管理员（攻击强度 {severity}/10）。"
+        except BaseException as e:
+            logger.exception("AI守卫: 工具调用失败")
+            return f"上报失败：{e}"
 
     # ---------- 上报 ----------
 

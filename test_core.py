@@ -5,7 +5,7 @@ import re
 import sys
 import time
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 # 直接加载插件源码中的静态逻辑
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -204,8 +204,8 @@ class TestThreshold(unittest.TestCase):
         self.assertEqual(p3._threshold_for("aiocqhttp:FriendMessage:123"), 6)
 
 
-class TestFullJudgement(unittest.TestCase):
-    """全量判断：对话中消息都过 LLM（无概率），报不报看 sensitivity 上报阈值。"""
+class TestKeywordBackstop(unittest.TestCase):
+    """守卫侧词库兜底：命中必查；未命中的阴阳怪气交给对话 LLM 的函数工具。"""
 
     @staticmethod
     def _plugin(**over):
@@ -236,17 +236,17 @@ class TestFullJudgement(unittest.TestCase):
 
         return calls, fake_judge
 
-    def test_clean_text_always_judged(self):
-        """未命中词库的对话消息也必查（全量判断，无概率）。"""
+    def test_clean_text_not_judged(self):
+        """未命中词库：守卫不判断（交给对话 LLM 的 ai_guard_report 工具）。"""
         p = self._plugin()
         calls, fake_judge = self._judge_recorder(p)
         p._judge = fake_judge
         ev = FakeEvent(messages=[FakeAt("10001", "甘心")], text="你什么水平啊", group_id="999888777")
         self._run(p, ev)
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls, [])
 
-    def test_keyword_hit_also_judged(self):
-        """词库命中的消息同样走全量判断通道。"""
+    def test_keyword_hit_always_judged(self):
+        """词库命中必查：脏话永远跑不掉。"""
         p = self._plugin()
         calls, fake_judge = self._judge_recorder(p)
         p._judge = fake_judge
@@ -255,11 +255,11 @@ class TestFullJudgement(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
     def test_judge_cd_blocks_second_call(self):
-        """统一 judge 冷却：5 分钟内同一会话不重复调 LLM（复用上次判定）。"""
+        """词库命中路径 judge 冷却：5 分钟内同一会话不重复调 LLM（复用上次判定）。"""
         p = self._plugin(judge_cooldown_minutes=5)
         calls, fake_judge = self._judge_recorder(p)
         p._judge = fake_judge
-        ev = FakeEvent(messages=[FakeAt("10001", "甘心")], text="你什么水平啊", group_id="999888777")
+        ev = FakeEvent(messages=[FakeAt("10001", "甘心")], text="你个傻逼", group_id="999888777")
         self._run(p, ev)
         self.assertEqual(len(calls), 1)
         # 冷却内：复用上次判定（有缓存），不调 LLM 但继续走后续逻辑
@@ -272,7 +272,7 @@ class TestFullJudgement(unittest.TestCase):
         p = self._plugin(judge_cooldown_minutes=5)
         calls, fake_judge = self._judge_recorder(p)
         p._judge = fake_judge
-        ev = FakeEvent(messages=[FakeAt("10001", "甘心")], text="你什么水平啊", group_id="999888777")
+        ev = FakeEvent(messages=[FakeAt("10001", "甘心")], text="你个傻逼", group_id="999888777")
         self._run(p, ev)
         p._judge_cd[ev.unified_msg_origin] = time.time()
         p._judging = set()
@@ -281,8 +281,78 @@ class TestFullJudgement(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
 
+class TestLlmTool(unittest.TestCase):
+    """函数工具 ai_guard_report：对话 LLM 觉得被骂时调用，守卫校验阈值后上报。"""
+
+    @staticmethod
+    def _plugin(**over):
+        p = make_plugin(over or None)
+        p._report = AsyncMock()
+        p._stats = {"llm_calls": 0, "reports": 0, "injections": 0, "tool_calls": 0}
+        p._cooldown = {}
+        p._history = {}
+        p._ignored = {}
+        return p
+
+    def _run(self, p, ev, severity, reason=""):
+        import asyncio
+
+        return asyncio.run(p.ai_guard_report(ev, severity, reason))
+
+    def test_above_threshold_reports(self):
+        """severity=6 >= 阈值4 → 上报。"""
+        p = self._plugin()
+        ev = FakeEvent(text="你他妈废物", group_id="999888777")
+        msg = self._run(p, ev, 6, "持续辱骂")
+        p._report.assert_awaited_once()
+        self.assertIn("已上报", msg)
+        self.assertEqual(p._stats["tool_calls"], 1)
+
+    def test_below_threshold_skips(self):
+        """severity=2 < 阈值4 → 不上报。"""
+        p = self._plugin()
+        ev = FakeEvent(text="随便说说", group_id="999888777")
+        msg = self._run(p, ev, 2)
+        p._report.assert_not_awaited()
+        self.assertIn("未达上报阈值", msg)
+
+    def test_cooldown_blocks(self):
+        """上报冷却内：不重复上报。"""
+        p = self._plugin()
+        ev = FakeEvent(text="又骂", group_id="999888777")
+        p._cooldown[ev.unified_msg_origin] = time.time()
+        msg = self._run(p, ev, 8)
+        p._report.assert_not_awaited()
+        self.assertIn("冷却", msg)
+
+    def test_severity_clamped(self):
+        """severity 越界钳制到 0-10。"""
+        p = self._plugin()
+        ev = FakeEvent(text="骂", group_id="999888777")
+        msg = self._run(p, ev, 99)
+        self.assertIn("10", msg)  # 钳到 10 后仍上报
+        p._report.assert_awaited_once()
+
+    def test_severity_invalid_defaults(self):
+        """severity 非数字 → 兜底 4（默认档）。"""
+        p = self._plugin()
+        ev = FakeEvent(text="骂", group_id="999888777")
+        msg = self._run(p, ev, "abc")
+        self.assertIn("已上报", msg)  # 4 >= 4
+        p._report.assert_awaited_once()
+
+    def test_private_threshold_lowered_tool(self):
+        """私聊阈值降 2：2 分私聊也上报（群聊 2 分不上报）。"""
+        p = self._plugin()
+        ev = FakeEvent(text="私聊骂", group_id="999888777")
+        ev.unified_msg_origin = "aiocqhttp:FriendMessage:888"
+        msg = self._run(p, ev, 2)
+        self.assertIn("已上报", msg)
+        p._report.assert_awaited_once()
+
+
 class TestSkipDoubleCheck(unittest.TestCase):
-    """跳过对话的双重保险（skip_sensitivity 独立于 check_weight / sensitivity）。"""
+    """跳过对话的双重保险（skip_sensitivity 独立于 sensitivity）。"""
 
     def test_skip_threshold_map(self):
         p = make_plugin()
