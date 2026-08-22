@@ -929,7 +929,7 @@ class Main(Star):
         except BaseException:
             pass
         low = text.lower()
-        # 2. 提到 bot 昵称/别名（配置 + 自动获取）
+        # 2. 提到 bot 昵称/别名（配置 + 自动读取昵称 + 平台实例名兜底）
         names = [
             n.strip()
             for n in str(self.config.get("bot_names", "") or "").split(",")
@@ -939,6 +939,14 @@ class Main(Star):
             nick = str(event.get_self_nickname() or "").strip()
             if nick and nick not in names:
                 names.append(nick)
+        except BaseException:
+            pass
+        # 平台实例名（unified_msg_origin 前缀，如 甘心:GroupMessage:xxx → 甘心）
+        try:
+            umo = event.unified_msg_origin or ""
+            platform = umo.split(":")[0] if ":" in umo else ""
+            if platform and platform not in names:
+                names.append(platform)
         except BaseException:
             pass
         for n in names:

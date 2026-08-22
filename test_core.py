@@ -188,6 +188,13 @@ class TestMention(unittest.TestCase):
         ev = FakeEvent(text="甘心你个废物")
         self.assertTrue(p._mentioned_ai(ev, "甘心你个废物"))
 
+    def test_platform_name_mention(self):
+        # bot_names 留空、昵称拿不到时，平台实例名（unified_msg_origin 前缀）兜底
+        p = make_plugin()
+        ev = FakeEvent(text="甘心我操死你个傻逼")
+        ev.unified_msg_origin = "甘心:GroupMessage:1043353080"
+        self.assertTrue(p._mentioned_ai(ev, "甘心我操死你个傻逼"))
+
     def test_no_mention_not_detected(self):
         p = make_plugin()
         ev = FakeEvent(text="你个傻逼")  # 没@没提AI
