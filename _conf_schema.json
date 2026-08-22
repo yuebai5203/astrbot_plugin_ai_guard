@@ -100,11 +100,23 @@
     "default": true,
     "hint": "总开关：开启后，判定攻击可跳过当前对话（AI 不回复）"
   },
+  "skip_reply_message": {
+    "description": "辱骂跳过回复",
+    "type": "string",
+    "default": "检测到辱骂消息，跳过此轮对话",
+    "hint": "判定辱骂攻击并跳过对话时，发给骂人者的回复文案（可编辑，留空用默认）"
+  },
   "skip_inject_enabled": {
     "description": "注入跳过开关",
     "type": "bool",
     "default": true,
     "hint": "独立开关：开启后，确认注入攻击也跳过当前对话（AI 不回复）。与辱骂跳过互不影响"
+  },
+  "skip_inject_message": {
+    "description": "注入跳过回复",
+    "type": "string",
+    "default": "检测到注入攻击，跳过此轮对话",
+    "hint": "确认注入攻击并跳过对话时，发给攻击者的回复文案（可编辑，留空用默认）"
   },
   "skip_sensitivity": {
     "description": "跳过敏感度",

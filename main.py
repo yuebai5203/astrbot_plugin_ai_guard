@@ -173,9 +173,15 @@ class Main(Star):
         if verdict.get("_attack", False) and self._should_skip(verdict, hit, key):
             event.stop_event()
             if verdict.get("injection"):
-                skip_msg = "检测到注入攻击，跳过此轮对话"
+                skip_msg = str(
+                    self.config.get("skip_inject_message", "")
+                    or "检测到注入攻击，跳过此轮对话"
+                )
             else:
-                skip_msg = "检测到辱骂消息，跳过此轮对话"
+                skip_msg = str(
+                    self.config.get("skip_reply_message", "")
+                    or "检测到辱骂消息，跳过此轮对话"
+                )
             try:
                 await event.send(MessageChain().message(skip_msg))
                 logger.info(f"AI守卫: 已接管对话，发送跳过提示 ({key})")

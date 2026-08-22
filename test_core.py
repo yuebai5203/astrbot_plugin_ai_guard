@@ -421,6 +421,33 @@ class TestSkipDoubleCheck(unittest.TestCase):
         # 辱骂：总开关仍开 → 照常判断
         self.assertTrue(p._should_skip({"severity": 7, "injection": False}, hit=True, key="aiocqhttp:GroupMessage:123"))
 
+    def test_skip_messages_editable(self):
+        """跳过回复文案可编辑：辱骂/注入各读各的配置，留空用默认。"""
+        p = make_plugin({
+            "skip_reply_message": "闭嘴！",
+            "skip_inject_message": "想黑我？",
+        })
+        # 辱骂读 skip_reply_message
+        self.assertEqual(
+            str(p.config.get("skip_reply_message", "") or "检测到辱骂消息，跳过此轮对话"),
+            "闭嘴！",
+        )
+        # 注入读 skip_inject_message
+        self.assertEqual(
+            str(p.config.get("skip_inject_message", "") or "检测到注入攻击，跳过此轮对话"),
+            "想黑我？",
+        )
+        # 留空回退默认
+        p2 = make_plugin()
+        self.assertEqual(
+            str(p2.config.get("skip_reply_message", "") or "检测到辱骂消息，跳过此轮对话"),
+            "检测到辱骂消息，跳过此轮对话",
+        )
+        self.assertEqual(
+            str(p2.config.get("skip_inject_message", "") or "检测到注入攻击，跳过此轮对话"),
+            "检测到注入攻击，跳过此轮对话",
+        )
+
 
 class TestMention(unittest.TestCase):
     def test_at_bot(self):
