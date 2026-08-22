@@ -1,7 +1,7 @@
 name: astrbot_plugin_ai_guard
 display_name: AI守卫
 desc: LLM 识别是否有人在认真且持续地辱骂 AI，玩笑不算；判定为攻击后带最近30条上下文合并转发到管理群，方便查看对方和 AI 聊了什么。
-version: 1.0.0
+version: 1.1.0
 author: yuebai
 repo: https://github.com/yuebai5203/astrbot_plugin_ai_guard
 astrbot_version: ">=4.24.1"
