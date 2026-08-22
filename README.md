@@ -59,7 +59,7 @@
 | require_mention | true | 群聊仅检测 @ 机器人或提起 AI 的消息（私聊不受限） |
 | mention_keywords | 甘心,宝宝,宝贝 | 唤醒词（逗号分隔），群聊命中即视为提起 AI（与关键词唤醒插件兼容） |
 | reply_window_minutes | 10 | 对话窗口：bot 回复过某人后，该人此窗口内的后续消息视为与 AI 对话中（不依赖唤醒词，兼容任意唤醒方式） |
-| bot_names | 空 | 机器人昵称/别名（逗号分隔），用于「提起 AI」匹配，留空自动读昵称 |
+| bot_names | 空 | 机器人昵称/别名（逗号分隔），用于「提起 AI」匹配；留空自动读昵称 + 平台实例名（如 甘心） |
 | skip_reply_enabled | true | 判定攻击后自动跳过此轮对话（AI 不回复，发提示） |
 | skip_reply_message | 检测到辱骂消息，跳过此轮对话 | 跳过对话时发送的提示文案 |
 | delete_friend_on_private_ban | true | 私聊拉黑时删除好友（QQ 禁言仅限群聊） |
