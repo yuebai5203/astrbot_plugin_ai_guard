@@ -172,7 +172,10 @@ class Main(Star):
         # 当面一套：是否跳过当前对话走独立判断（双重保险，见 _should_skip）
         if verdict.get("_attack", False) and self._should_skip(verdict, hit, key):
             event.stop_event()
-            skip_msg = "检测到辱骂消息，跳过此轮对话"
+            if verdict.get("injection"):
+                skip_msg = "检测到注入攻击，跳过此轮对话"
+            else:
+                skip_msg = "检测到辱骂消息，跳过此轮对话"
             try:
                 await event.send(MessageChain().message(skip_msg))
                 logger.info(f"AI守卫: 已接管对话，发送跳过提示 ({key})")
@@ -1174,14 +1177,15 @@ class Main(Star):
         ① 关键词必须命中（hit）——纯权重触发的"疑似"消息只上报，不跳过；
         ② LLM 审查过分程度——severity 达到跳过阈值，或注入确认。
         判定为攻击但未达标：AI 照常回复（当面一套），管理群已收到合并转发（背后一套）。
-        总开关 skip_reply_enabled=false 时永不跳过。
+        两个独立总开关：辱骂跳走走 skip_reply_enabled，注入跳走走 skip_inject_enabled。
         """
-        if not bool(self.config.get("skip_reply_enabled", True)):
-            return False
         if not hit:
             return False
         if verdict.get("injection"):
-            return True
+            # 注入跳过独立开关：注入不看 severity 阈值（注入本来就是冲 AI 来的）
+            return bool(self.config.get("skip_inject_enabled", True))
+        if not bool(self.config.get("skip_reply_enabled", True)):
+            return False
         return int(verdict.get("severity", 0) or 0) >= self._skip_threshold_for(key)
 
     def _in_cooldown(self, key: str) -> bool:

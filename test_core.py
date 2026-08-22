@@ -95,6 +95,7 @@ def make_plugin(config_override=None):
         "confirm_timeout_minutes": 10,
         "context_count": 30,
         "skip_reply_enabled": True,
+        "skip_inject_enabled": True,
         "focus_sessions": [],
         "ignore_sessions": [],
     }
@@ -403,10 +404,22 @@ class TestSkipDoubleCheck(unittest.TestCase):
         self.assertTrue(p._should_skip(verdict, hit=True, key="aiocqhttp:GroupMessage:123"))
 
     def test_skip_master_switch_off(self):
-        """skip_reply_enabled=false：永不跳过，只上报。"""
+        """skip_reply_enabled=false：辱骂永不跳过，只上报；注入走独立开关不受影响。"""
         p = make_plugin({"skip_reply_enabled": False})
-        verdict = {"severity": 10, "injection": True}
+        # 辱骂：总开关关 → 不跳过
+        verdict = {"severity": 10, "injection": False}
         self.assertFalse(p._should_skip(verdict, hit=True, key="aiocqhttp:GroupMessage:123"))
+        # 注入：独立开关默认开 → 依然跳过
+        verdict2 = {"severity": 3, "injection": True}
+        self.assertTrue(p._should_skip(verdict2, hit=True, key="aiocqhttp:GroupMessage:123"))
+
+    def test_skip_inject_switch_off(self):
+        """skip_inject_enabled=false：注入不跳过；辱骂不受影响。"""
+        p = make_plugin({"skip_inject_enabled": False})
+        verdict = {"severity": 9, "injection": True}
+        self.assertFalse(p._should_skip(verdict, hit=True, key="aiocqhttp:GroupMessage:123"))
+        # 辱骂：总开关仍开 → 照常判断
+        self.assertTrue(p._should_skip({"severity": 7, "injection": False}, hit=True, key="aiocqhttp:GroupMessage:123"))
 
 
 class TestMention(unittest.TestCase):
