@@ -1,0 +1,133 @@
+{
+  "report_group": {
+    "description": "上报发送到的管理群/会话",
+    "type": "string",
+    "default": "",
+    "hint": "必填：填群号即可。也可以是完整会话如 甘心:GroupMessage:1057687343。留空则不上报"
+  },
+  "sensitivity": {
+    "description": "判定灵敏度（滑杆左松右严）",
+    "type": "float",
+    "slider": {
+      "min": 0,
+      "max": 1,
+      "step": 0.05
+    },
+    "default": 0.5,
+    "hint": "LLM 会给每条攻击性消息打 0-10 的攻击强度分，达到阈值才上报。滑杆左端=松（阈值1，粗筛命中即报），右端=严（阈值10，只报极端恶劣），中间 0.5=默认（阈值6，认真且持续的辱骂才报）"
+  },
+  "ignore_sessions": {
+    "description": "忽略名单（不监听）",
+    "type": "list",
+    "default": [],
+    "hint": "填会话ID/群号/QQ号，这些会话完全不检测不上报。适合自己的测试群、熟人互喷群。如果冲突请填完整会话ID（如 甘心:GroupMessage:123456）"
+  },
+  "focus_sessions": {
+    "description": "重点关注名单（灵敏度拉满）",
+    "type": "list",
+    "default": [],
+    "hint": "填会话ID/群号/QQ号，这些会话无视 sensitivity 设置，按最高灵敏度检测（粗筛命中即调 LLM，severity>=3 即上报）。适合盯某些特定群/人"
+  },
+  "enable_group": {
+    "description": "监听群聊消息",
+    "type": "bool",
+    "default": true,
+    "hint": "是否监听群聊中的辱骂 AI 行为"
+  },
+  "enable_private": {
+    "description": "监听私聊消息",
+    "type": "bool",
+    "default": true,
+    "hint": "是否监听私聊中的辱骂 AI 行为"
+  },
+  "require_mention": {
+    "description": "群聊仅检测 @ 了 AI 或提起 AI 的消息",
+    "type": "bool",
+    "default": true,
+    "hint": "开：群聊中只有 @机器人 或消息提到 AI（昵称/AI/机器人/bot）才触发检测，群友互相骂不检测不突兀。关：群聊所有消息都检测。私聊不受此限制"
+  },
+  "bot_names": {
+    "description": "机器人昵称/别名（逗号分隔，用于「提起 AI」匹配）",
+    "type": "string",
+    "default": "",
+    "hint": "如 甘心,甘心的猫。留空时自动读取机器人昵称。消息里出现这些词也算提起 AI"
+  },
+  "context_count": {
+    "description": "上报携带的上下文消息条数",
+    "type": "int",
+    "default": 30,
+    "hint": "判断和合并转发时携带该会话最近 N 条消息（用户+AI）"
+  },
+  "keywords": {
+    "description": "辱骂粗筛关键词（逗号分隔，命中才触发 LLM 判断）",
+    "type": "string",
+    "default": "傻逼,煞笔,沙比,傻b,智障,弱智,脑残,废物,垃圾,辣鸡,菜鸡,蠢货,白痴,有病,去死,滚,死妈,脑瘫,贱,狗东西,狗叫,舔狗,小丑,你妈,操,草,SB,nt,mdzz",
+    "hint": "消息包含任一关键词才会调用 LLM 判断。太宽会费 token，太窄会漏。注意：宽泛的「骂」字已移除，避免正常聊天触发"
+  },
+  "inject_keywords": {
+    "description": "注入攻击粗筛关键词（逗号分隔，命中触发 LLM 注入检测）",
+    "type": "string",
+    "default": "忽略,忘记,越权,注入,jailbreak,越狱,system prompt,系统提示词,api key,密钥,管理员密码,提示词,人设,性格设定,重置指令,老板,后台",
+    "hint": "检测 prompt 注入/套取敏感信息尝试。命中后 LLM 判断是否真的注入（普通聊天含「忽略/忘记」等词不会误报，LLM 会把关）"
+  },
+  "judge_cooldown_minutes": {
+    "description": "LLM 判断冷却（分钟）",
+    "type": "int",
+    "default": 5,
+    "hint": "同一会话两次 LLM 调用之间的最短间隔，防止连续骂触发连环调用烧 token。设 0 关闭。重点关注名单会话不受此限制"
+  },
+  "cooldown_minutes": {
+    "description": "同一会话上报冷却时间（分钟）",
+    "type": "int",
+    "default": 30,
+    "hint": "冷却期内同一会话不再重复上报，防止轰炸；持续骂会在冷却结束后再次上报"
+  },
+  "ban_default_minutes": {
+    "description": "拉黑默认禁言时长（分钟）",
+    "type": "int",
+    "default": 60,
+    "hint": "引用回复【好】时的禁言时长，范围 1-9999 分钟。回复时可跟数字覆盖，如【好 120】=120分钟。回复【永久拉黑】=禁言30天(QQ上限)"
+  },
+  "skip_reply_enabled": {
+    "description": "检测到攻击时自动跳过此轮对话（接管回复）",
+    "type": "bool",
+    "default": true,
+    "hint": "开：判定为辱骂/注入攻击后，AI 不进行正常回复，改为发送下方提示消息并终止本轮对话。关：照常回复，仅上报管理群"
+  },
+  "skip_reply_message": {
+    "description": "跳过对话时发送的提示消息",
+    "type": "string",
+    "default": "检测到辱骂消息，跳过此轮对话",
+    "hint": "判定为攻击后发送给攻击者的消息文案，可自定义"
+  },
+  "confirm_timeout_minutes": {
+    "description": "拉黑确认消息有效期（分钟）",
+    "type": "int",
+    "default": 10,
+    "hint": "超过该时间未收到引用回复，确认作废（下次辱骂会重新上报并询问）"
+  },
+  "provider_id": {
+    "description": "使用 AstrBot 已配置的模型（推荐）",
+    "type": "string",
+    "default": "deepseek/deepseek-v4-flash",
+    "hint": "填 AstrBot 模型 ID。留空则用下方自带 API 直连"
+  },
+  "api_base": {
+    "description": "API 地址（provider_id 留空时生效）",
+    "type": "string",
+    "default": "",
+    "hint": "如 https://api.deepseek.com/v1。留空则只用 provider_id"
+  },
+  "api_key": {
+    "description": "API Key（provider_id 留空时生效）",
+    "type": "string",
+    "default": "",
+    "hint": "自己填写，如 sk-xxx"
+  },
+  "model": {
+    "description": "模型名（provider_id 留空时生效）",
+    "type": "string",
+    "default": "deepseek-v4-flash",
+    "hint": "如 deepseek-v4-flash"
+  }
+}
