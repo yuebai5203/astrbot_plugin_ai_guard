@@ -18,10 +18,11 @@ except ImportError:
 
 
 class Main(Star):
-    """AI守卫：LLM 识别是否有人在认真且持续地辱骂 AI，带上下文合并转发到管理群。
+    """AI守卫：对话 AI 在被辱骂/阴阳怪气时主动上报，脏话/注入词库命中由守卫兜底。
 
-    监听所有群聊/私聊消息，关键词粗筛后带最近 N 条上下文让 LLM 给"攻击强度"打分
-    （0-10），再按灵敏度滑杆映射的阈值决定是否上报。上报后发拉黑确认消息，
+    双通道：① 对话 LLM 觉得被骂/被阴阳时调用 ai_guard_report 工具上报；
+    ② 词库命中时守卫独立 LLM 判断（脏话/注入跑不掉）。
+    上报 = 带最近 N 条上下文合并转发到管理群 + 发拉黑确认消息，
     管理群引用回复【好】= 禁言拉黑，【不好】= 不管。拉黑后继续骂会再次上报。
     """
 
@@ -377,8 +378,7 @@ class Main(Star):
     def _threshold_for(self, key: str) -> int:
         """敏感度调节器①（sensitivity）：上报判定阈值（滑杆左松右严）。
 
-        LLM 给消息打 0-10 攻击强度分，达到该阈值就合并转发上报（背后一套）。
-        全量判断无概率：对话中消息都过 LLM，报不报只看这个阈值。
+        攻击强度分达到该阈值就合并转发上报（背后一套），工具上报与词库兜底共用。
         映射：0 → 1（稍微不满就报）; 0.5 → 4（阴阳怪气/轻度吐槽就报，默认）; 1 → 8（只报明确攻击）。
         私聊阈值自动降 2（私聊对象就是 AI）；重点关注名单固定 3。
         """
@@ -436,6 +436,18 @@ class Main(Star):
             if self._in_cooldown(key):
                 return "该会话近期已上报过，冷却期内不重复上报。"
             context = self._get_context(key)
+            # 守卫未监听到该会话（如未 @AI 的群消息）：至少带上触发这条消息，上报不空手
+            if not context:
+                context = [
+                    {
+                        "role": "user",
+                        "sender_id": str(event.get_sender_id() or ""),
+                        "sender_name": event.get_sender_name()
+                        or event.get_sender_id()
+                        or "用户",
+                        "text": event.get_message_str() or "（触发上报）",
+                    }
+                ]
             attacker_id = str(event.get_sender_id() or "")
             self._stats["tool_calls"] = self._stats.get("tool_calls", 0) + 1
             await self._report(
@@ -998,7 +1010,7 @@ class Main(Star):
     def _replied_recently(self, event: AstrMessageEvent) -> bool:
         """发送者是否在窗口期内被 bot 回复过（视为与 AI 对话中）。
 
-        不依赖唤醒词表：任何方式唤醒 bot 并得到回复后，
+        不依赖静态唤醒词：任何方式唤醒 bot 并得到回复后，
         该用户后续消息都纳入检测（兼容 wakepro 兴趣词/其他插件唤醒）。
         """
         try:

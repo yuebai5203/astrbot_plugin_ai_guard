@@ -44,7 +44,7 @@
     "description": "群聊提及门槛",
     "type": "bool",
     "default": true,
-    "hint": "开启：群聊仅检测 @机器人 或提及 AI 的消息；关闭：全量检测（消耗更高）"
+    "hint": "开启：群聊仅监听 @机器人 或提及 AI 的消息；关闭：群聊所有消息都过词库筛选（未命中不调 LLM）"
   },
   "bot_names": {
     "description": "机器人昵称",
