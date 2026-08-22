@@ -195,6 +195,13 @@ class TestMention(unittest.TestCase):
         ev.unified_msg_origin = "甘心:GroupMessage:1043353080"
         self.assertTrue(p._mentioned_ai(ev, "甘心我操死你个傻逼"))
 
+    def test_mention_keywords(self):
+        p = make_plugin({"mention_keywords": "甘心,宝宝,宝贝"})
+        for t in ["宝宝你个废物", "宝贝在吗", "甘心在吗"]:
+            self.assertTrue(p._mentioned_ai(FakeEvent(text=t), t), t)
+        p2 = make_plugin({"mention_keywords": ""})
+        self.assertFalse(p2._mentioned_ai(FakeEvent(text="宝宝在吗"), "宝宝在吗"))
+
     def test_no_mention_not_detected(self):
         p = make_plugin()
         ev = FakeEvent(text="你个傻逼")  # 没@没提AI

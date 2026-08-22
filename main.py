@@ -952,10 +952,22 @@ class Main(Star):
         for n in names:
             if n and n.lower() in low:
                 return True
+        # 2.5 唤醒词（如 甘心/宝宝/宝贝 等关键词唤醒，命中即视为提起 AI）
+        for kw in self._mention_keywords():
+            if kw and kw.lower() in low:
+                return True
         # 3. 提到 AI / 机器人 / bot
         if re.search(r"(?<![a-z0-9])ai(?![a-z0-9])", low) or "机器人" in low or "bot" in low:
             return True
         return False
+
+    def _mention_keywords(self) -> list:
+        """唤醒词列表（mention_keywords 配置，逗号分隔）。"""
+        return [
+            k.strip()
+            for k in str(self.config.get("mention_keywords", "") or "").split(",")
+            if k.strip()
+        ]
 
     def _session_key(self, event: AstrMessageEvent) -> str:
         return event.unified_msg_origin or "unknown"

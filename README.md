@@ -57,6 +57,7 @@
 | focus_sessions | 空 | 重点关注名单：这些会话灵敏度拉满（阈值3） |
 | enable_group / enable_private | true | 是否监听群聊/私聊 |
 | require_mention | true | 群聊仅检测 @ 机器人或提起 AI 的消息（私聊不受限） |
+| mention_keywords | 甘心,宝宝,宝贝 | 唤醒词（逗号分隔），群聊命中即视为提起 AI（与关键词唤醒插件兼容） |
 | bot_names | 空 | 机器人昵称/别名（逗号分隔），用于「提起 AI」匹配，留空自动读昵称 |
 | skip_reply_enabled | true | 判定攻击后自动跳过此轮对话（AI 不回复，发提示） |
 | skip_reply_message | 检测到辱骂消息，跳过此轮对话 | 跳过对话时发送的提示文案 |
