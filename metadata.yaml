@@ -1,10 +1,10 @@
 name: astrbot_plugin_ai_guard
-display_name: AI守卫
-short_desc: LLM 自动识别辱骂 AI 的行为并上报管理群，支持拉黑/禁言/删除好友
+display_name: AI检测·守卫
+short_desc: AI 辱骂/阴阳怪气检测，合并转发上报管理群，支持拉黑禁言
 desc: |
-  LLM 自动识别是否有人在认真且持续地辱骂 AI（玩笑不算），判定为攻击后带最近 30 条聊天记录用 QQ 合并转发发到管理群，方便查看对方和 AI 聊了什么。
-  支持引用回复确认拉黑（禁言/删除好友/永久拉黑）、Prompt 注入攻击检测、自动跳过对话、黑名单管理、群聊提及门槛（仅检测 @ 或提起 AI 的消息，不打扰群友互喷）。
-version: 1.1.0
+  自动检测谁在辱骂/阴阳怪气 AI：对话全量过 LLM 打分（0-10），达到上报敏感度就带聊天记录合并转发到管理群。
+  支持分清攻击对象（骂群友不算）、注入攻击检测、跳过对话、拉黑/禁言/删好友、黑名单、两档敏感度滑杆。
+version: 1.4.3
 author: yuebai
 repo: https://github.com/yuebai5203/astrbot_plugin_ai_guard
 astrbot_version: ">=4.24.1"
@@ -13,7 +13,9 @@ support_platforms:
   - telegram
 social_link: https://github.com/yuebai5203
 tags:
+  - AI检测
   - 辱骂检测
+  - AI守卫
   - 拉黑
   - 禁言
   - 注入检测

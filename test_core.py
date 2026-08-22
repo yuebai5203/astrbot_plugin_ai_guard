@@ -96,8 +96,6 @@ def make_plugin(config_override=None):
         "context_count": 30,
         "skip_reply_enabled": True,
         "skip_reply_message": "检测到辱骂消息，跳过此轮对话",
-        "llm_full_check": False,
-        "backstop_cooldown_minutes": 3,
         "focus_sessions": [],
         "ignore_sessions": [],
     }
@@ -109,7 +107,6 @@ def make_plugin(config_override=None):
     p._blacklist_path = "/tmp/test_blacklist.json"
     p._cooldown = {}
     p._judge_cd = {}
-    p._backstop_cd = {}
     p._last_verdict = {}
     p._replied_users = {}
     return p
@@ -134,6 +131,41 @@ class TestParse(unittest.TestCase):
         self.assertIsNone(Main._parse_verdict("不是JSON"))
         self.assertIsNone(Main._parse_verdict(""))
 
+    def test_parse_verdict_target_other(self):
+        """攻击对象是群友（target=other）：severity 强制归 0，不算攻击。"""
+        r = Main._parse_verdict(
+            '{"severity": 6, "reason": "骂群友", "attacker": "12345678", '
+            '"injection": false, "injection_type": "", "target": "other"}'
+        )
+        self.assertEqual(r["severity"], 0)
+        self.assertEqual(r["target"], "other")
+
+    def test_parse_verdict_target_ai(self):
+        """攻击对象是 AI 本人（target=ai）：正常评分。"""
+        r = Main._parse_verdict(
+            '{"severity": 6, "reason": "骂AI", "attacker": "12345678", '
+            '"injection": false, "injection_type": "", "target": "ai"}'
+        )
+        self.assertEqual(r["severity"], 6)
+        self.assertEqual(r["target"], "ai")
+
+    def test_parse_verdict_target_default_ai(self):
+        """旧模型没输出 target：缺省按 ai 处理（保持原有行为）。"""
+        r = Main._parse_verdict(
+            '{"severity": 5, "reason": "骂人", "attacker": "12345678", '
+            '"injection": false, "injection_type": ""}'
+        )
+        self.assertEqual(r["severity"], 5)
+        self.assertEqual(r["target"], "ai")
+
+    def test_parse_verdict_target_other_injection_kept(self):
+        """骂群友但带注入：注入不受 target 影响（注入本来就是冲 AI 来的）。"""
+        r = Main._parse_verdict(
+            '{"severity": 0, "reason": "", "attacker": "", '
+            '"injection": true, "injection_type": "套取密钥", "target": "other"}'
+        )
+        self.assertTrue(r["injection"])
+
     def test_parse_action(self):
         p = make_plugin()
         self.assertEqual(p._parse_action("好")["type"], "ban")
@@ -150,11 +182,11 @@ class TestParse(unittest.TestCase):
 class TestThreshold(unittest.TestCase):
     def test_sensitivity_map(self):
         p = make_plugin()
-        self.assertEqual(p._threshold_for("x"), 6)  # 0.5 -> 6
+        self.assertEqual(p._threshold_for("x"), 4)  # 0.5 -> 4 阴阳怪气就报
         p2 = make_plugin({"sensitivity": 0.0})
         self.assertEqual(p2._threshold_for("x"), 1)  # 0 -> 1 全报
         p3 = make_plugin({"sensitivity": 1.0})
-        self.assertEqual(p3._threshold_for("x"), 10)  # 1 -> 10 只报极端
+        self.assertEqual(p3._threshold_for("x"), 8)  # 1 -> 8 只报明确攻击
 
     def test_focus_threshold(self):
         p = make_plugin({"focus_sessions": ["1057687343"]})
@@ -162,18 +194,18 @@ class TestThreshold(unittest.TestCase):
 
     def test_private_threshold_lowered(self):
         p = make_plugin()
-        # 群聊默认 6，私聊自动降 2 → 4
-        self.assertEqual(p._threshold_for("aiocqhttp:GroupMessage:123"), 6)
-        self.assertEqual(p._threshold_for("aiocqhttp:FriendMessage:123"), 4)
+        # 群聊默认 4，私聊自动降 2 → 2
+        self.assertEqual(p._threshold_for("aiocqhttp:GroupMessage:123"), 4)
+        self.assertEqual(p._threshold_for("aiocqhttp:FriendMessage:123"), 2)
         p2 = make_plugin({"sensitivity": 0.0})
         # 灵敏度 0：群聊 1，私聊不低于 1
         self.assertEqual(p2._threshold_for("aiocqhttp:FriendMessage:123"), 1)
         p3 = make_plugin({"sensitivity": 1.0})
-        self.assertEqual(p3._threshold_for("aiocqhttp:FriendMessage:123"), 8)
+        self.assertEqual(p3._threshold_for("aiocqhttp:FriendMessage:123"), 6)
 
 
-class TestBackstop(unittest.TestCase):
-    """LLM 兜底通道：不依赖词库，对话中消息全量过 LLM 判断。"""
+class TestFullJudgement(unittest.TestCase):
+    """全量判断：对话中消息都过 LLM（无概率），报不报看 sensitivity 上报阈值。"""
 
     @staticmethod
     def _plugin(**over):
@@ -182,7 +214,6 @@ class TestBackstop(unittest.TestCase):
         p._judging = set()
         p._stats = {"llm_calls": 0, "reports": 0, "injections": 0}
         p._judge_cd = {}
-        p._backstop_cd = {}
         p._cooldown = {}
         p._last_verdict = {}
         return p
@@ -192,74 +223,105 @@ class TestBackstop(unittest.TestCase):
 
         asyncio.run(p.on_user_message(ev))
 
-    def test_backstop_off_skips_clean_text(self):
-        """默认关闭：未命中词库的阴阳怪气不触发 LLM 判断。"""
+    def _judge_recorder(self, p):
+        calls = []
+
+        async def fake_judge(event, key):
+            calls.append(key)
+            # 模拟真 _judge 的行为：标记冷却 + 存判定缓存
+            p._judge_cd[key] = time.time()
+            verdict = {"severity": 2, "attacker": "601514573", "injection": False, "_attack": False}
+            p._last_verdict[key] = verdict
+            return verdict
+
+        return calls, fake_judge
+
+    def test_clean_text_always_judged(self):
+        """未命中词库的对话消息也必查（全量判断，无概率）。"""
         p = self._plugin()
-        calls = []
-
-        async def fake_judge(event, key, backstop=False):
-            calls.append((key, backstop))
-            return {"severity": 2, "attacker": "601514573", "injection": False, "_attack": False}
-
-        p._judge = fake_judge
-        ev = FakeEvent(messages=[FakeAt("10001", "甘心")], text="你什么水平啊", group_id="999888777")
-        self._run(p, ev)
-        self.assertEqual(calls, [])
-
-    def test_backstop_on_judges_clean_text(self):
-        """开启后：未命中词库的对话消息也走 LLM 判断（backstop=True）。"""
-        p = self._plugin(llm_full_check=True)
-        calls = []
-
-        async def fake_judge(event, key, backstop=False):
-            calls.append((key, backstop))
-            return {"severity": 2, "attacker": "601514573", "injection": False, "_attack": False}
-
+        calls, fake_judge = self._judge_recorder(p)
         p._judge = fake_judge
         ev = FakeEvent(messages=[FakeAt("10001", "甘心")], text="你什么水平啊", group_id="999888777")
         self._run(p, ev)
         self.assertEqual(len(calls), 1)
-        self.assertTrue(calls[0][1])  # backstop=True
 
-    def test_backstop_on_keyword_hit_normal_path(self):
-        """开启后：命中词库的脏话仍走原路径（backstop=False，不受兜底冷却影响）。"""
-        p = self._plugin(llm_full_check=True)
-        calls = []
-
-        async def fake_judge(event, key, backstop=False):
-            calls.append((key, backstop))
-            return {"severity": 2, "attacker": "601514573", "injection": False, "_attack": False}
-
+    def test_keyword_hit_also_judged(self):
+        """词库命中的消息同样走全量判断通道。"""
+        p = self._plugin()
+        calls, fake_judge = self._judge_recorder(p)
         p._judge = fake_judge
         ev = FakeEvent(messages=[FakeAt("10001", "甘心")], text="你个傻逼", group_id="999888777")
         self._run(p, ev)
         self.assertEqual(len(calls), 1)
-        self.assertFalse(calls[0][1])  # backstop=False
 
-    def test_backstop_own_cooldown(self):
-        """兜底有独立冷却：3 分钟内不重复调 LLM（粗筛冷却不影响兜底）。"""
-        p = self._plugin(llm_full_check=True, judge_cooldown_minutes=5)
-        calls = []
-
-        async def fake_judge(event, key, backstop=False):
-            calls.append((key, backstop))
-            return {"severity": 2, "attacker": "601514573", "injection": False, "_attack": False}
-
+    def test_judge_cd_blocks_second_call(self):
+        """统一 judge 冷却：5 分钟内同一会话不重复调 LLM（复用上次判定）。"""
+        p = self._plugin(judge_cooldown_minutes=5)
+        calls, fake_judge = self._judge_recorder(p)
         p._judge = fake_judge
         ev = FakeEvent(messages=[FakeAt("10001", "甘心")], text="你什么水平啊", group_id="999888777")
-        # 第一次：触发兜底判断
         self._run(p, ev)
         self.assertEqual(len(calls), 1)
-        # 模拟粗筛路径已调过 LLM（judge_cd 已标记），兜底仍应判断
+        # 冷却内：复用上次判定（有缓存），不调 LLM 但继续走后续逻辑
+        p._judging = set()
+        self._run(p, ev)
+        self.assertEqual(len(calls), 1)
+
+    def test_judge_cd_no_cache_passes(self):
+        """冷却内无缓存：放行本轮（不调 LLM）。"""
+        p = self._plugin(judge_cooldown_minutes=5)
+        calls, fake_judge = self._judge_recorder(p)
+        p._judge = fake_judge
+        ev = FakeEvent(messages=[FakeAt("10001", "甘心")], text="你什么水平啊", group_id="999888777")
+        self._run(p, ev)
         p._judge_cd[ev.unified_msg_origin] = time.time()
         p._judging = set()
+        p._last_verdict = {}  # 清缓存
         self._run(p, ev)
-        self.assertEqual(len(calls), 2)
-        # 兜底冷却内：不再调 LLM
-        p._backstop_cd[ev.unified_msg_origin] = time.time()
-        p._judging = set()
-        self._run(p, ev)
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 1)
+
+
+class TestSkipDoubleCheck(unittest.TestCase):
+    """跳过对话的双重保险（skip_sensitivity 独立于 check_weight / sensitivity）。"""
+
+    def test_skip_threshold_map(self):
+        p = make_plugin()
+        # 群聊：0→10, 0.5→7, 1→4
+        self.assertEqual(p._skip_threshold_for("aiocqhttp:GroupMessage:123"), 7)
+        p2 = make_plugin({"skip_sensitivity": 0.0})
+        self.assertEqual(p2._skip_threshold_for("aiocqhttp:GroupMessage:123"), 10)
+        p3 = make_plugin({"skip_sensitivity": 1.0})
+        self.assertEqual(p3._skip_threshold_for("aiocqhttp:GroupMessage:123"), 4)
+        # 私聊自动降 2
+        p4 = make_plugin()
+        self.assertEqual(p4._skip_threshold_for("aiocqhttp:FriendMessage:123"), 5)
+
+    def test_skip_requires_keyword_hit(self):
+        """双重保险①：未命中关键词（纯权重触发）即使 severity 高也不跳过，只上报。"""
+        p = make_plugin()
+        verdict = {"severity": 9, "injection": False, "_attack": True}
+        self.assertFalse(p._should_skip(verdict, hit=False, key="aiocqhttp:GroupMessage:123"))
+
+    def test_skip_needs_severity_above_threshold(self):
+        """双重保险②：命中关键词但 severity 未达跳过阈值 → 不跳过（当面一套，背后一套）。"""
+        p = make_plugin()  # skip_sensitivity 0.5 → 跳过阈值 7
+        key = "aiocqhttp:GroupMessage:123"
+        # severity 6：已上报（背后一套），但不到 7 → AI 照常回复
+        self.assertFalse(p._should_skip({"severity": 6, "injection": False}, hit=True, key=key))
+        # severity 7：达标 → 跳过
+        self.assertTrue(p._should_skip({"severity": 7, "injection": False}, hit=True, key=key))
+
+    def test_skip_injection_confirmed(self):
+        """注入确认 + 关键词命中 → 直接跳过（注入不看阈值）。"""
+        p = make_plugin()
+        verdict = {"severity": 3, "injection": True, "injection_type": "套取密钥"}
+        self.assertTrue(p._should_skip(verdict, hit=True, key="aiocqhttp:GroupMessage:123"))
+
+    def test_skip_master_switch_off(self):
+        """skip_reply_enabled=false：永不跳过，只上报。"""
+        p = make_plugin({"skip_reply_enabled": False})
+        verdict = {"severity": 10, "injection": True}
+        self.assertFalse(p._should_skip(verdict, hit=True, key="aiocqhttp:GroupMessage:123"))
 
 
 class TestMention(unittest.TestCase):
@@ -292,12 +354,15 @@ class TestMention(unittest.TestCase):
         ev.unified_msg_origin = "甘心:GroupMessage:1043353080"
         self.assertTrue(p._mentioned_ai(ev, "甘心我操死你个傻逼"))
 
-    def test_mention_keywords(self):
-        p = make_plugin({"mention_keywords": "甘心,宝宝,宝贝"})
-        for t in ["宝宝你个废物", "宝贝在吗", "甘心在吗"]:
-            self.assertTrue(p._mentioned_ai(FakeEvent(text=t), t), t)
-        p2 = make_plugin({"mention_keywords": ""})
-        self.assertFalse(p2._mentioned_ai(FakeEvent(text="宝宝在吗"), "宝宝在吗"))
+    def test_mention_keywords_removed(self):
+        """唤醒词已移除：不再有静态关键词触发通道（靠 @ / 昵称 / reply_window）。"""
+        p = make_plugin({"mention_keywords": "宝宝,宝贝"})
+        self.assertFalse(p._mentioned_ai(FakeEvent(text="宝宝你个废物"), "宝宝你个废物"))
+        self.assertFalse(p._mentioned_ai(FakeEvent(text="宝贝在吗"), "宝贝在吗"))
+        # 昵称/平台名仍然有效
+        ev = FakeEvent(text="甘心你个废物")
+        ev.unified_msg_origin = "甘心:GroupMessage:1043353080"
+        self.assertTrue(p._mentioned_ai(ev, "甘心你个废物"))
 
     def test_replied_recently(self):
         # 任何唤醒方式：bot 回复过该用户后，窗口期内该用户消息视为与 AI 对话中
