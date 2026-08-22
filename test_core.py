@@ -153,6 +153,17 @@ class TestThreshold(unittest.TestCase):
         p = make_plugin({"focus_sessions": ["1057687343"]})
         self.assertEqual(p._threshold_for("aiocqhttp:GroupMessage:1057687343"), 3)
 
+    def test_private_threshold_lowered(self):
+        p = make_plugin()
+        # 群聊默认 6，私聊自动降 2 → 4
+        self.assertEqual(p._threshold_for("aiocqhttp:GroupMessage:123"), 6)
+        self.assertEqual(p._threshold_for("aiocqhttp:FriendMessage:123"), 4)
+        p2 = make_plugin({"sensitivity": 0.0})
+        # 灵敏度 0：群聊 1，私聊不低于 1
+        self.assertEqual(p2._threshold_for("aiocqhttp:FriendMessage:123"), 1)
+        p3 = make_plugin({"sensitivity": 1.0})
+        self.assertEqual(p3._threshold_for("aiocqhttp:FriendMessage:123"), 8)
+
 
 class TestMention(unittest.TestCase):
     def test_at_bot(self):

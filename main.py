@@ -330,7 +330,11 @@ class Main(Star):
     # ---------- 阈值 ----------
 
     def _threshold_for(self, key: str) -> int:
-        """灵敏度 → 判定阈值。滑杆左松右严：0→1(全报) 0.5→6 1→10(只报极端)。"""
+        """灵敏度 → 判定阈值。滑杆左松右严：0→1(全报) 0.5→6 1→10(只报极端)。
+
+        私聊阈值自动降 2：私聊对象就是 AI，骂一句也算骂 AI；
+        群聊保持原阈值防止群友互喷误伤。
+        """
         if self._is_focus(key):
             return self._FOCUS_THRESHOLD
         sens = self.config.get("sensitivity", 0.5)
@@ -338,7 +342,15 @@ class Main(Star):
             sens = 0.5
         sens = max(0.0, min(1.0, float(sens)))
         # 0 → 1, 1 → 10
-        return max(1, min(10, int(1 + sens * 9 + 0.5)))
+        threshold = max(1, min(10, int(1 + sens * 9 + 0.5)))
+        if self._is_private_key(key):
+            threshold = max(1, threshold - 2)
+        return threshold
+
+    @staticmethod
+    def _is_private_key(key: str) -> bool:
+        """会话是否为私聊。"""
+        return "FriendMessage" in (key or "") or "C2CMessage" in (key or "")
 
     def _is_focus(self, key: str) -> bool:
         focus = [str(x).strip() for x in self.config.get("focus_sessions", []) or []]
