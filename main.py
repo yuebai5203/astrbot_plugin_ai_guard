@@ -50,6 +50,8 @@ class Main(Star):
         self._judge_cd: dict[str, float] = {}
         # 最近一次判定结果缓存: {session: verdict}，冷却期内复用，避免重复调 LLM
         self._last_verdict: dict[str, dict] = {}
+        # bot 最近回复过的用户: {(session, sender_id): ts}，兼容任意唤醒方式
+        self._replied_users: dict[tuple, float] = {}
         # 永久拉黑黑名单: {qq: {name, reason, group_id, ts, banned_by}}
         self._blacklist: dict[str, dict] = {}
         # 统计
@@ -170,6 +172,14 @@ class Main(Star):
             text = " ".join(p for p in parts if p).strip()
             if not text:
                 return
+            # 记录 bot 刚回复过谁：该用户后续消息视为「与 AI 对话中」（兼容任意唤醒方式）
+            try:
+                key = event.unified_msg_origin or self._session_key(event)
+                sid = str(event.get_sender_id() or "")
+                if key and sid:
+                    self._replied_users[(key, sid)] = time.time()
+            except BaseException:
+                pass
             self._push(
                 event,
                 role="bot",
@@ -908,6 +918,30 @@ class Main(Star):
         except BaseException:
             return False
 
+    def _replied_recently(self, event: AstrMessageEvent) -> bool:
+        """发送者是否在窗口期内被 bot 回复过（视为与 AI 对话中）。
+
+        不依赖唤醒词表：任何方式唤醒 bot 并得到回复后，
+        该用户后续消息都纳入检测（兼容 wakepro 兴趣词/其他插件唤醒）。
+        """
+        try:
+            key = event.unified_msg_origin or self._session_key(event)
+            sid = str(event.get_sender_id() or "")
+            if not key or not sid:
+                return False
+            ts = self._replied_users.get((key, sid))
+            if not ts:
+                return False
+            window_min = self.config.get("reply_window_minutes", 10)
+            if window_min is None:
+                window_min = 10
+            window = float(window_min) * 60
+            if window <= 0:
+                return False
+            return (time.time() - ts) <= window
+        except BaseException:
+            return False
+
     def _mentioned_ai(self, event: AstrMessageEvent, text: str) -> bool:
         """是否 @ 了 bot 或提起 AI。私聊始终 True（说话对象就是 AI）。"""
         try:
@@ -919,6 +953,9 @@ class Main(Star):
             return True
         # 未开启提及门槛：全部检测
         if not bool(self.config.get("require_mention", True)):
+            return True
+        # 0. 最近被 bot 回复过（任何唤醒方式触发的对话都算提起 AI）
+        if self._replied_recently(event):
             return True
         # 1. @ 了 bot
         try:

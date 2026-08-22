@@ -105,6 +105,7 @@ def make_plugin(config_override=None):
     p._cooldown = {}
     p._judge_cd = {}
     p._last_verdict = {}
+    p._replied_users = {}
     return p
 
 
@@ -201,6 +202,23 @@ class TestMention(unittest.TestCase):
             self.assertTrue(p._mentioned_ai(FakeEvent(text=t), t), t)
         p2 = make_plugin({"mention_keywords": ""})
         self.assertFalse(p2._mentioned_ai(FakeEvent(text="宝宝在吗"), "宝宝在吗"))
+
+    def test_replied_recently(self):
+        # 任何唤醒方式：bot 回复过该用户后，窗口期内该用户消息视为与 AI 对话中
+        p = make_plugin({"reply_window_minutes": 10})
+        ev = FakeEvent(text="你说话啊", sender_id="999")
+        ev.unified_msg_origin = "aiocqhttp:GroupMessage:1057687343"
+        key = ("aiocqhttp:GroupMessage:1057687343", "999")
+        self.assertFalse(p._replied_recently(ev))
+        p._replied_users[key] = time.time() - 60  # 1 分钟前回复过
+        self.assertTrue(p._replied_recently(ev))
+        self.assertTrue(p._mentioned_ai(ev, "你说话啊"))
+        p._replied_users[key] = time.time() - 3600  # 1 小时前
+        self.assertFalse(p._replied_recently(ev))
+        # 窗口 0 = 关闭
+        p2 = make_plugin({"reply_window_minutes": 0})
+        p2._replied_users[key] = time.time()
+        self.assertFalse(p2._replied_recently(ev))
 
     def test_no_mention_not_detected(self):
         p = make_plugin()

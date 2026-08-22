@@ -58,6 +58,12 @@
     "default": "甘心,宝宝,宝贝",
     "hint": "关键词唤醒插件常用词，如：甘心,宝宝,宝贝。被这些词唤醒的对话也会纳入检测"
   },
+  "reply_window_minutes": {
+    "description": "对话窗口（分钟）：bot 回复过某人后，该人此窗口内的后续消息视为与 AI 对话中",
+    "type": "int",
+    "default": 10,
+    "hint": "不依赖唤醒词表：bot 用任何方式（@、唤醒词、兴趣词、其他插件）回复过谁，谁就是对话对象，后续骂 AI 都会被检测。0 关闭"
+  },
   "context_count": {
     "description": "上报携带的上下文消息条数",
     "type": "int",
