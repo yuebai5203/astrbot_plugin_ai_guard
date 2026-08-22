@@ -649,5 +649,75 @@ class TestConfig(unittest.TestCase):
             self.assertIn("hint", v)
 
 
+class TestHistoryRecord(unittest.TestCase):
+    """历史记录：所有消息（含未提到 AI 的普通群聊）都进 history，
+    合并转发 = 最近 context_count 条完整群聊现场。"""
+
+    @staticmethod
+    def _plugin(**over):
+        p = make_plugin(over or None)
+        p._history = {}
+        p._judging = set()
+        p._last_verdict = {}
+        p._judge_cd = {}
+        p._cooldown = {}
+        p._replied_users = {}
+        p._blacklist = {}
+        p._ignored = {}
+        p._pending = {}
+        return p
+
+    def _run(self, p, ev):
+        import asyncio
+
+        return asyncio.run(p.on_user_message(ev))
+
+    def test_plain_group_msg_recorded(self):
+        """群聊中未提到 AI 的普通消息也进 history。"""
+        p = self._plugin()
+        ev = FakeEvent(messages=[], text="今天天气不错", group_id="999888777")
+        self._run(p, ev)
+        key = ev.unified_msg_origin
+        hist = list(p._history.get(key, []))
+        self.assertEqual(len(hist), 1)
+        self.assertEqual(hist[0]["text"], "今天天气不错")
+        self.assertEqual(hist[0]["role"], "user")
+
+    def test_attacker_and_bystander_both_recorded(self):
+        """攻击者消息与普通群友消息都进 history（合并转发不丢群聊内容）。"""
+        p = self._plugin()
+        ev1 = FakeEvent(messages=[], text="大家一起来听歌", group_id="999888777", sender_id="222")
+        ev2 = FakeEvent(messages=[FakeAt("10001", "甘心")], text="你个傻逼", group_id="999888777", sender_id="601514573")
+        self._run(p, ev1)
+        self._run(p, ev2)
+        hist = list(p._history.get(ev1.unified_msg_origin, []))
+        texts = [m["text"] for m in hist]
+        self.assertIn("大家一起来听歌", texts)
+        self.assertIn("你个傻逼", texts)
+
+    def test_history_respects_context_count(self):
+        """history 按 context_count 截断（deque maxlen）。"""
+        p = self._plugin(context_count=5)
+        ev = FakeEvent(messages=[], text="x", group_id="999888777")
+        for i in range(8):
+            ev._text = f"消息{i}"
+            self._run(p, ev)
+        hist = list(p._history.get(ev.unified_msg_origin, []))
+        self.assertEqual(len(hist), 5)
+        self.assertEqual(hist[0]["text"], "消息3")
+        self.assertEqual(hist[-1]["text"], "消息7")
+
+    def test_blacklist_user_msg_recorded(self):
+        """黑名单用户的辱骂消息也进 history（留档），拦截照常。"""
+        p = self._plugin()
+        p._blacklist = {"666": {"group_id": "", "reason": "test"}}
+        p._in_cooldown = MagicMock(return_value=True)
+        ev = FakeEvent(messages=[], text="你个傻逼", group_id="999888777", sender_id="666")
+        self._run(p, ev)
+        hist = list(p._history.get(ev.unified_msg_origin, []))
+        self.assertEqual(len(hist), 1)
+        self.assertEqual(hist[0]["sender_id"], "666")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

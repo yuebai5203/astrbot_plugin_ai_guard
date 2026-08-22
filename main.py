@@ -135,13 +135,7 @@ class Main(Star):
         text = event.get_message_str().strip()
         if not text:
             return
-        # 群聊中只有 @ 了 bot 或提起 AI 才检测（避免群友互喷被突兀拦截）
-        if not self._mentioned_ai(event, text):
-            return
-        # 黑名单用户：不调 LLM，直接拦截 + 续期禁言 + 冷却上报
-        if self._in_blacklist(event.get_sender_id()):
-            await self._handle_blacklisted(event, text)
-            return
+        # 先入历史：所有消息（含普通群友闲聊）都记录，合并转发=最近30条完整群聊现场
         self._push(
             event,
             role="user",
@@ -149,6 +143,13 @@ class Main(Star):
             sender_name=event.get_sender_name() or event.get_sender_id() or "用户",
             text=text,
         )
+        # 群聊中只有 @ 了 bot 或提起 AI 才检测（避免群友互喷被突兀拦截）
+        if not self._mentioned_ai(event, text):
+            return
+        # 黑名单用户：不调 LLM，直接拦截 + 续期禁言 + 冷却上报
+        if self._in_blacklist(event.get_sender_id()):
+            await self._handle_blacklisted(event, text)
+            return
         hit_abuse = self._hit_keywords(text)
         hit_inject = self._hit_inject_keywords(text)
         hit = hit_abuse or hit_inject
@@ -774,6 +775,7 @@ class Main(Star):
         for f in [f for f, i in self._pending.items() if now - i["ts"] > timeout]:
             del self._pending[f]
 
+    @staticmethod
     @staticmethod
     def _find_name(context: list[dict], attacker_id: str) -> str:
         if not attacker_id:
