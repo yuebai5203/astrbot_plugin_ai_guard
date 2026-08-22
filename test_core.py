@@ -95,7 +95,6 @@ def make_plugin(config_override=None):
         "confirm_timeout_minutes": 10,
         "context_count": 30,
         "skip_reply_enabled": True,
-        "skip_reply_message": "检测到辱骂消息，跳过此轮对话",
         "focus_sessions": [],
         "ignore_sessions": [],
     }

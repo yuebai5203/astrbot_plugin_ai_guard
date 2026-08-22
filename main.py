@@ -169,9 +169,7 @@ class Main(Star):
         # 当面一套：是否跳过当前对话走独立判断（双重保险，见 _should_skip）
         if verdict.get("_attack", False) and self._should_skip(verdict, hit, key):
             event.stop_event()
-            skip_msg = str(
-                self.config.get("skip_reply_message", "") or "检测到辱骂消息，跳过此轮对话"
-            )
+            skip_msg = "检测到辱骂消息，跳过此轮对话"
             try:
                 await event.send(MessageChain().message(skip_msg))
                 logger.info(f"AI守卫: 已接管对话，发送跳过提示 ({key})")

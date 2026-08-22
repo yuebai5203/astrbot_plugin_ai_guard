@@ -111,12 +111,6 @@
     "default": 0.5,
     "hint": "跳过判定阈值（滑杆左松右严）：需关键词命中 + 评分达标才跳过"
   },
-  "skip_reply_message": {
-    "description": "跳过提示语",
-    "type": "string",
-    "default": "检测到辱骂消息，跳过此轮对话",
-    "hint": "跳过响应时发送的提示文案"
-  },
   "delete_friend_on_private_ban": {
     "description": "私聊拉黑删好友",
     "type": "bool",
