@@ -100,6 +100,12 @@
     "default": "检测到辱骂消息，跳过此轮对话",
     "hint": "判定为攻击后发送给攻击者的消息文案，可自定义"
   },
+  "delete_friend_on_private_ban": {
+    "description": "私聊拉黑时删除好友（QQ 禁言仅限群聊）",
+    "type": "bool",
+    "default": true,
+    "hint": "开：私聊被骂且确认拉黑时，调用删除好友（OneBot delete_friend）。关：仅提示记为已处理"
+  },
   "confirm_timeout_minutes": {
     "description": "拉黑确认消息有效期（分钟）",
     "type": "int",

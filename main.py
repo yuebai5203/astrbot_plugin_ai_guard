@@ -491,7 +491,8 @@ class Main(Star):
 
         answer = (event.get_message_str() or "").strip()
         attacker = str(matched["attacker_id"])
-        group_id = event.get_group_id()
+        # 骂人者所在群：从原始会话解析（管理群的群号≠骂人者所在群！）
+        group_id = self._group_id_from_session(matched["session"]) or event.get_group_id()
         session = matched["session"]
 
         action = self._parse_action(answer)
@@ -557,10 +558,25 @@ class Main(Star):
                     MessageChain().message(f"⚠️ 禁言失败（无权限或 API 错误）：已将 QQ {attacker} 记为已处理，继续辱骂会再次上报。"),
                 )
         else:
-            await self.context.send_message(
-                self._target_session(report_group, event),
-                MessageChain().message(f"ℹ️ 私聊场景无法禁言，QQ {attacker} 记为已处理。继续辱骂会再次上报。"),
-            )
+            # 私聊场景无法禁言：尝试删除好友（可配置关闭）
+            deleted = False
+            if bool(self.config.get("delete_friend_on_private_ban", True)):
+                try:
+                    await event.bot.call_action("delete_friend", user_id=int(attacker))
+                    deleted = True
+                except BaseException as e:
+                    logger.warning(f"AI守卫: 删除好友失败 {attacker}: {e}")
+            if deleted:
+                await self.context.send_message(
+                    self._target_session(report_group, event),
+                    MessageChain().message(f"🗑️ 已删除好友：QQ {attacker}（私聊无法禁言，已删好友。若开启黑名单则继续辱骂会再次上报）。"),
+                )
+                logger.info(f"AI守卫: 已删除好友 {attacker}（私聊拉黑）")
+            else:
+                await self.context.send_message(
+                    self._target_session(report_group, event),
+                    MessageChain().message(f"ℹ️ 私聊场景无法禁言，QQ {attacker} 记为已处理。继续辱骂会再次上报。"),
+                )
 
     def _default_ban_minutes(self) -> int:
         try:
@@ -740,7 +756,7 @@ class Main(Star):
         return removed
 
     async def _handle_blacklisted(self, event: AstrMessageEvent, text: str) -> None:
-        """黑名单用户触发：直接拦截跳过 + 续期禁言 + 冷却上报。不调 LLM。"""
+        """黑名单用户触发：直接拦截跳过 + 续期禁言/删好友 + 冷却上报。不调 LLM。"""
         qq = str(event.get_sender_id() or "")
         if bool(self.config.get("skip_reply_enabled", True)):
             event.stop_event()
@@ -757,7 +773,15 @@ class Main(Star):
         self._set_cooldown(key)
         info = self._blacklist.get(qq, {})
         group_id = event.get_group_id()
-        await self._apply_ban(event, qq, group_id, self._PERMA_MINUTES)
+        if group_id:
+            await self._apply_ban(event, qq, group_id, self._PERMA_MINUTES)
+        elif bool(self.config.get("delete_friend_on_private_ban", True)):
+            # 私聊：删除好友
+            try:
+                await event.bot.call_action("delete_friend", user_id=int(qq))
+                logger.info(f"AI守卫: 黑名单私聊用户已删好友 {qq}")
+            except BaseException as e:
+                logger.warning(f"AI守卫: 黑名单删好友失败 {qq}: {e}")
         # 更新黑名单里的群号（可能在别的群再次被抓）
         if group_id:
             info["group_id"] = str(group_id)
@@ -774,6 +798,14 @@ class Main(Star):
                 )
             except BaseException:
                 logger.exception("AI守卫: 黑名单续期上报失败")
+
+    @staticmethod
+    def _group_id_from_session(session: str) -> str | None:
+        """从会话ID解析群号：aiocqhttp:GroupMessage:123456 -> 123456。私聊返回 None。"""
+        parts = (session or "").split(":")
+        if len(parts) >= 3 and "GroupMessage" in parts[1]:
+            return parts[2]
+        return None
 
     @staticmethod
     def _extract_target(event: AstrMessageEvent, text: str) -> str | None:

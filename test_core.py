@@ -204,6 +204,13 @@ class TestBlacklist(unittest.TestCase):
         ev = FakeEvent(messages=[FakeAt("10001", "自己")], text="永久拉黑")
         self.assertIsNone(p._extract_target(ev, "永久拉黑"))
 
+    def test_group_id_from_session(self):
+        self.assertEqual(
+            Main._group_id_from_session("aiocqhttp:GroupMessage:123456789"), "123456789"
+        )
+        self.assertIsNone(Main._group_id_from_session("aiocqhttp:FriendMessage:88888888"))
+        self.assertIsNone(Main._group_id_from_session(""))
+
     def test_add_remove(self):
         p = make_plugin()
         p._blacklist_add("12345678", name="测试", reason="r")
