@@ -141,7 +141,9 @@ class Main(Star):
             sender_name=event.get_sender_name() or event.get_sender_id() or "用户",
             text=text,
         )
-        hit = self._hit_keywords(text) or self._hit_inject_keywords(text)
+        hit_abuse = self._hit_keywords(text)
+        hit_inject = self._hit_inject_keywords(text)
+        hit = hit_abuse or hit_inject
         key = event.unified_msg_origin or self._session_key(event)
         if not key:
             return
@@ -156,9 +158,17 @@ class Main(Star):
         if not self._is_focus(key):
             in_cd = self._in_judge_cd(key) or self._in_cooldown(key)
             if in_cd:
-                verdict = self._last_verdict.get(key)
-                if verdict is not None:
-                    logger.debug(f"AI守卫: {key} 冷却中，复用上次判定")
+                cached = self._last_verdict.get(key)
+                if cached is not None:
+                    cached_inject = bool(cached.get("injection", False))
+                    # 注入/辱骂类型不匹配（如先骂后注入、先注入后骂）→ 强制重判，防止文案串类
+                    if cached_inject == hit_inject:
+                        verdict = cached
+                        logger.debug(f"AI守卫: {key} 冷却中，复用上次判定")
+                    else:
+                        logger.debug(
+                            f"AI守卫: {key} 冷却中但注入/辱骂类型不匹配，强制重判"
+                        )
                 else:
                     logger.debug(f"AI守卫: {key} 冷却中且无缓存，放行本轮")
                     return
