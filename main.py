@@ -756,17 +756,17 @@ class Main(Star):
         return removed
 
     async def _handle_blacklisted(self, event: AstrMessageEvent, text: str) -> None:
-        """黑名单用户触发：直接拦截跳过 + 续期禁言/删好友 + 冷却上报。不调 LLM。"""
+        """黑名单用户触发：强制拦截（不受 skip_reply_enabled 影响）+ 续期禁言/删好友 + 冷却上报。不调 LLM。"""
         qq = str(event.get_sender_id() or "")
-        if bool(self.config.get("skip_reply_enabled", True)):
-            event.stop_event()
-            skip_msg = str(
-                self.config.get("skip_reply_message", "") or "检测到辱骂消息，跳过此轮对话"
-            )
-            try:
-                await event.send(MessageChain().message(skip_msg))
-            except BaseException:
-                logger.exception("AI守卫: 黑名单拦截发送跳过提示失败")
+        # 黑名单强制拦截：无论是否开启跳过对话，黑名单用户一律不允许与 AI 对话
+        event.stop_event()
+        bl_msg = str(
+            self.config.get("blacklist_reply_message", "") or "您已被永久拉黑，无法与 AI 对话"
+        )
+        try:
+            await event.send(MessageChain().message(bl_msg))
+        except BaseException:
+            logger.exception("AI守卫: 黑名单拦截发送提示失败")
         key = event.unified_msg_origin or self._session_key(event)
         if self._in_cooldown(key):
             return

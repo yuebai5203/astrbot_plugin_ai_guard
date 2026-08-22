@@ -106,6 +106,12 @@
     "default": true,
     "hint": "开：私聊被骂且确认拉黑时，调用删除好友（OneBot delete_friend）。关：仅提示记为已处理"
   },
+  "blacklist_reply_message": {
+    "description": "黑名单用户被拦截时的提示消息",
+    "type": "string",
+    "default": "您已被永久拉黑，无法与 AI 对话",
+    "hint": "黑名单用户在私聊/群聊中与 AI 对话时收到的提示文案。黑名单拦截是强制的，不受「跳过对话」开关影响"
+  },
   "confirm_timeout_minutes": {
     "description": "拉黑确认消息有效期（分钟）",
     "type": "int",
