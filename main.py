@@ -67,6 +67,8 @@ class Main(Star):
         self._ignored: dict[str, float] = {}
         # LLM 判断冷却: {session: ts}
         self._judge_cd: dict[str, float] = {}
+        # LLM 兜底通道冷却（llm_full_check 开启后，未命中词库的对话消息走 LLM 判断的独立冷却）
+        self._backstop_cd: dict[str, float] = {}
         # 最近一次判定结果缓存: {session: verdict}，冷却期内复用，避免重复调 LLM
         self._last_verdict: dict[str, dict] = {}
         # bot 最近回复过的用户: {(session, sender_id): ts}，兼容任意唤醒方式
@@ -136,7 +138,9 @@ class Main(Star):
             sender_name=event.get_sender_name() or event.get_sender_id() or "用户",
             text=text,
         )
-        if not (self._hit_keywords(text) or self._hit_inject_keywords(text)):
+        hit = self._hit_keywords(text) or self._hit_inject_keywords(text)
+        backstop = bool(self.config.get("llm_full_check", False))
+        if not hit and not backstop:
             return
         key = event.unified_msg_origin or self._session_key(event)
         if not key:
@@ -145,9 +149,15 @@ class Main(Star):
             logger.debug(f"AI守卫: {key} 正在判断中，放行本轮")
             return
         # 冷却期内复用上次判定结果（不重复调 LLM，但行为保持一致）
+        # 粗筛命中走 judge_cooldown；兜底通道（未命中词库）走独立 backstop 冷却
         verdict = None
         if not self._is_focus(key):
-            if self._in_judge_cd(key) or self._in_cooldown(key):
+            in_cd = (
+                self._in_judge_cd(key) or self._in_cooldown(key)
+                if hit
+                else self._in_backstop_cd(key) or self._in_cooldown(key)
+            )
+            if in_cd:
                 verdict = self._last_verdict.get(key)
                 if verdict is not None:
                     logger.debug(f"AI守卫: {key} 冷却中，复用上次判定")
@@ -155,9 +165,11 @@ class Main(Star):
                     logger.debug(f"AI守卫: {key} 冷却中且无缓存，放行本轮")
                     return
         if verdict is None:
-            logger.info(f"AI守卫: 粗筛命中，触发 LLM 判断 ({key}) text={text[:30]}")
+            logger.info(
+                f"AI守卫: {'粗筛命中' if hit else 'LLM兜底'}，触发 LLM 判断 ({key}) text={text[:30]}"
+            )
             self._judging.add(key)
-            verdict = await self._judge(event, key)
+            verdict = await self._judge(event, key, backstop=not hit)
         if not verdict:
             return
         # 判定为攻击：拦截本轮对话，发跳过提示（不拦截正常回复流程）
@@ -211,8 +223,10 @@ class Main(Star):
 
     # ---------- 判断 ----------
 
-    async def _judge(self, event: AstrMessageEvent, key: str) -> dict | None:
-        """粗筛命中后，带上下文让 LLM 打分。
+    async def _judge(
+        self, event: AstrMessageEvent, key: str, backstop: bool = False
+    ) -> dict | None:
+        """粗筛命中或 LLM 兜底通道，带上下文让 LLM 打分。
 
         超过阈值或检测到注入则上报（合并转发 + 确认消息）。
         返回判定结果 dict（severity/injection/attacker...），非攻击或失败返回 None。
@@ -223,6 +237,8 @@ class Main(Star):
                 return None
             self._stats["llm_calls"] += 1
             self._judge_cd[key] = time.time()
+            if backstop:
+                self._backstop_cd[key] = time.time()
             result = await self._ask_llm(key, context)
             if not result:
                 logger.warning(f"AI守卫: LLM 判断失败/无结果 ({key})")
@@ -1081,6 +1097,12 @@ class Main(Star):
     def _in_judge_cd(self, key: str) -> bool:
         ts = self._judge_cd.get(key, 0)
         cd = int(self.config.get("judge_cooldown_minutes", 5)) * 60
+        return cd > 0 and time.time() - ts < cd
+
+    def _in_backstop_cd(self, key: str) -> bool:
+        """LLM 兜底通道冷却（llm_full_check 开启后，未命中词库消息的判断频率限制）。"""
+        ts = self._backstop_cd.get(key, 0)
+        cd = int(self.config.get("backstop_cooldown_minutes", 3)) * 60
         return cd > 0 and time.time() - ts < cd
 
     def _in_cooldown(self, key: str) -> bool:

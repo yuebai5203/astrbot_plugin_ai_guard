@@ -44,6 +44,9 @@ class FakeEvent:
     def get_sender_id(self):
         return self._sender_id
 
+    def get_sender_name(self):
+        return f"用户{self._sender_id}"
+
     def get_self_id(self):
         return self._self_id
 
@@ -93,6 +96,8 @@ def make_plugin(config_override=None):
         "context_count": 30,
         "skip_reply_enabled": True,
         "skip_reply_message": "检测到辱骂消息，跳过此轮对话",
+        "llm_full_check": False,
+        "backstop_cooldown_minutes": 3,
         "focus_sessions": [],
         "ignore_sessions": [],
     }
@@ -104,6 +109,7 @@ def make_plugin(config_override=None):
     p._blacklist_path = "/tmp/test_blacklist.json"
     p._cooldown = {}
     p._judge_cd = {}
+    p._backstop_cd = {}
     p._last_verdict = {}
     p._replied_users = {}
     return p
@@ -164,6 +170,96 @@ class TestThreshold(unittest.TestCase):
         self.assertEqual(p2._threshold_for("aiocqhttp:FriendMessage:123"), 1)
         p3 = make_plugin({"sensitivity": 1.0})
         self.assertEqual(p3._threshold_for("aiocqhttp:FriendMessage:123"), 8)
+
+
+class TestBackstop(unittest.TestCase):
+    """LLM 兜底通道：不依赖词库，对话中消息全量过 LLM 判断。"""
+
+    @staticmethod
+    def _plugin(**over):
+        p = make_plugin(over or None)
+        p._push = MagicMock()
+        p._judging = set()
+        p._stats = {"llm_calls": 0, "reports": 0, "injections": 0}
+        p._judge_cd = {}
+        p._backstop_cd = {}
+        p._cooldown = {}
+        p._last_verdict = {}
+        return p
+
+    def _run(self, p, ev):
+        import asyncio
+
+        asyncio.run(p.on_user_message(ev))
+
+    def test_backstop_off_skips_clean_text(self):
+        """默认关闭：未命中词库的阴阳怪气不触发 LLM 判断。"""
+        p = self._plugin()
+        calls = []
+
+        async def fake_judge(event, key, backstop=False):
+            calls.append((key, backstop))
+            return {"severity": 2, "attacker": "601514573", "injection": False, "_attack": False}
+
+        p._judge = fake_judge
+        ev = FakeEvent(messages=[FakeAt("10001", "甘心")], text="你什么水平啊", group_id="999888777")
+        self._run(p, ev)
+        self.assertEqual(calls, [])
+
+    def test_backstop_on_judges_clean_text(self):
+        """开启后：未命中词库的对话消息也走 LLM 判断（backstop=True）。"""
+        p = self._plugin(llm_full_check=True)
+        calls = []
+
+        async def fake_judge(event, key, backstop=False):
+            calls.append((key, backstop))
+            return {"severity": 2, "attacker": "601514573", "injection": False, "_attack": False}
+
+        p._judge = fake_judge
+        ev = FakeEvent(messages=[FakeAt("10001", "甘心")], text="你什么水平啊", group_id="999888777")
+        self._run(p, ev)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0][1])  # backstop=True
+
+    def test_backstop_on_keyword_hit_normal_path(self):
+        """开启后：命中词库的脏话仍走原路径（backstop=False，不受兜底冷却影响）。"""
+        p = self._plugin(llm_full_check=True)
+        calls = []
+
+        async def fake_judge(event, key, backstop=False):
+            calls.append((key, backstop))
+            return {"severity": 2, "attacker": "601514573", "injection": False, "_attack": False}
+
+        p._judge = fake_judge
+        ev = FakeEvent(messages=[FakeAt("10001", "甘心")], text="你个傻逼", group_id="999888777")
+        self._run(p, ev)
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(calls[0][1])  # backstop=False
+
+    def test_backstop_own_cooldown(self):
+        """兜底有独立冷却：3 分钟内不重复调 LLM（粗筛冷却不影响兜底）。"""
+        p = self._plugin(llm_full_check=True, judge_cooldown_minutes=5)
+        calls = []
+
+        async def fake_judge(event, key, backstop=False):
+            calls.append((key, backstop))
+            return {"severity": 2, "attacker": "601514573", "injection": False, "_attack": False}
+
+        p._judge = fake_judge
+        ev = FakeEvent(messages=[FakeAt("10001", "甘心")], text="你什么水平啊", group_id="999888777")
+        # 第一次：触发兜底判断
+        self._run(p, ev)
+        self.assertEqual(len(calls), 1)
+        # 模拟粗筛路径已调过 LLM（judge_cd 已标记），兜底仍应判断
+        p._judge_cd[ev.unified_msg_origin] = time.time()
+        p._judging = set()
+        self._run(p, ev)
+        self.assertEqual(len(calls), 2)
+        # 兜底冷却内：不再调 LLM
+        p._backstop_cd[ev.unified_msg_origin] = time.time()
+        p._judging = set()
+        self._run(p, ev)
+        self.assertEqual(len(calls), 2)
 
 
 class TestMention(unittest.TestCase):

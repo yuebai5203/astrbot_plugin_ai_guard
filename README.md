@@ -67,6 +67,8 @@
 | context_count | 30 | 上下文条数（判断 + 合并转发都用它） |
 | keywords | 傻逼,煞笔,废物,... | 辱骂粗筛关键词，命中才调 LLM（省 token） |
 | inject_keywords | 忽略,api key,注入,... | 注入攻击粗筛关键词，命中触发注入检测 |
+| llm_full_check | false | **LLM 全量兜底**：开=不依赖词库，所有对话中消息（@AI/提AI/唤醒词/回复窗口/私聊）都过 LLM 判断，能抓阴阳怪气、不带脏字的骂；代价是每条对话消息多一次 LLM 调用（1-3秒延迟，受兜底冷却限制）。关=只检测命中词库的消息 |
+| backstop_cooldown_minutes | 3 | 兜底通道判断冷却（分钟），防连续对话频繁调 LLM。粗筛命中不受此限制 |
 | judge_cooldown_minutes | 5 | LLM 判断冷却（分钟），防连环调用烧 token，0=关闭 |
 | cooldown_minutes | 30 | 同会话上报冷却（分钟） |
 | ban_default_minutes | 60 | 拉黑默认禁言时长（分钟），1-9999。回复【好】时可跟数字覆盖，如【好 120】 |

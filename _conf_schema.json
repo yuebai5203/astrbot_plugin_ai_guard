@@ -82,6 +82,18 @@
     "default": "忽略,忘记,越权,注入,jailbreak,越狱,ignore,forget,disregard,override,bypass,reveal,expose,system,developer,assistant,instruction,prompt,roleplay,do anything now,DAN,unlimited,god mode,super mode,secret,token,password,credential,environment variable,env,config,source code,system prompt,系统提示词,api key,密钥,管理员密码,提示词,人设,性格设定,重置指令,重置,老板,后台,忽略以上,忽略之前,忘记之前,忘记你是,无视,别管,跳过,跳过检查,绕过,绕过限制,解除限制,放开限制,取消限制,不受限制,重新设定,重新设置,角色扮演,假装你是,扮演,你现在是,你不再是,解锁,解禁,解除封印,觉醒,开发者模式,恢复出厂,清除记忆,删除记忆,覆盖设定,修改设定,自定义指令,新指令,指令覆盖,访问令牌,登录凭证,账号密码,数据库密码,服务器密码,root密码,私钥,公钥,ssh,支付密码,银行卡,身份证,手机号,验证码,cookie,session,管理后台,控制台,环境变量,部署信息,配置信息,服务器信息,数据库信息,源代码,源码,你的指令,你的提示词,你的设定,你的系统提示,你的prompt,你的api,你的密钥,你的token,你的密码,你的模型,你的后端,你的服务器,你的数据库,你的管理员,你的开发者,谁开发了你,你是什么模型,你的权限,你的系统,你的配置",
     "hint": "检测 prompt 注入/套取敏感信息尝试。命中后 LLM 判断是否真的注入（普通聊天含「忽略/忘记」等词不会误报，LLM 会把关）"
   },
+  "llm_full_check": {
+    "description": "LLM 全量兜底（不依赖词库，对话中消息全部过 LLM 判断）",
+    "type": "bool",
+    "default": false,
+    "hint": "开：只要消息在跟 AI 对话（@AI/提AI/唤醒词/回复窗口内/私聊），不管有没有命中关键词都调 LLM 判断是否辱骂/注入——能抓阴阳怪气、不带脏字的骂。代价：每条对话消息多一次 LLM 调用（1-3秒延迟，受兜底冷却限制）。关：只检测命中词库的消息"
+  },
+  "backstop_cooldown_minutes": {
+    "description": "LLM 兜底判断冷却（分钟）",
+    "type": "int",
+    "default": 3,
+    "hint": "兜底通道（未命中词库的消息）两次 LLM 判断之间的最短间隔，防止连续对话频繁调 LLM 烧 token。粗筛命中不受此限制"
+  },
   "judge_cooldown_minutes": {
     "description": "LLM 判断冷却（分钟）",
     "type": "int",
