@@ -703,14 +703,14 @@ class TestBlacklist(unittest.TestCase):
         self.assertFalse(p._in_blacklist("12345678"))
 
     def test_blacklisted_intercepted_without_mention(self):
-        """回归：拉黑用户不 @ AI 发消息也要被拦截（黑名单检查不依赖提及）。"""
+        """回归：拉黑用户不 @ AI 发消息也要被拦截（黑名单检查不依赖提及）。
+
+        彻底拉黑后群聊静默忽略：不回复、不提示。"""
         import asyncio
 
         p = make_plugin()
         p._push = MagicMock()
         p._blacklist = {"666": {"name": "坏蛋", "reason": "永久拉黑"}}
-        p._in_cooldown = MagicMock(return_value=True)  # 跳过禁言/上报副作用
-        p._apply_ban = MagicMock()
         stopped = []
         sent = []
 
@@ -724,7 +724,7 @@ class TestBlacklist(unittest.TestCase):
         ev = Ev(messages=[], text="今天天气不错", group_id="999888777", sender_id="666")
         asyncio.run(p.on_user_message(ev))
         self.assertEqual(len(stopped), 1, "黑名单用户不 @ AI 也必须被拦截")
-        self.assertTrue(any("拉黑" in s for s in sent))
+        self.assertEqual(sent, [], "群聊静默忽略：不发送任何提示消息")
 
     def _judge_harness(self, verdict):
         """构造直测真 _judge 的环境：mock 上下文和 LLM 返回。"""

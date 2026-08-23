@@ -146,7 +146,7 @@ class Main(Star):
             sender_name=event.get_sender_name() or event.get_sender_id() or "用户",
             text=text,
         )
-        # 黑名单用户：不调 LLM，直接拦截 + 续期禁言 + 冷却上报（不依赖是否 @ AI）
+        # 黑名单用户：静默忽略（不调 LLM，不依赖是否 @ AI）
         if self._in_blacklist(event.get_sender_id()):
             await self._handle_blacklisted(event, text)
             return
@@ -1016,48 +1016,22 @@ class Main(Star):
         return removed
 
     async def _handle_blacklisted(self, event: AstrMessageEvent, text: str) -> None:
-        """黑名单用户触发：强制拦截（不受 skip_reply_enabled 影响）+ 续期禁言/删好友 + 冷却上报。不调 LLM。"""
+        """黑名单用户触发：群聊静默忽略（不予理会），私聊删除好友。不调 LLM。"""
         qq = str(event.get_sender_id() or "")
-        # 黑名单强制拦截：无论是否开启跳过对话，黑名单用户一律不允许与 AI 对话
+        # 黑名单强制拦截：无论是否提及，黑名单用户一律不允许与 AI 对话
         event.stop_event()
-        bl_msg = str(
-            self.config.get("blacklist_reply_message", "") or "您已被永久拉黑，无法与 AI 对话"
-        )
-        try:
-            await event.send(MessageChain().message(bl_msg))
-        except BaseException:
-            logger.exception("AI守卫: 黑名单拦截发送提示失败")
-        key = event.unified_msg_origin or self._session_key(event)
-        if self._in_cooldown(key):
+        if event.get_group_id():
+            # 群聊：静默忽略——不回复、不提示、不重复禁言/上报
+            logger.info(f"AI守卫: 黑名单用户 {qq} 群聊消息已静默忽略")
             return
-        self._set_cooldown(key)
-        info = self._blacklist.get(qq, {})
-        group_id = event.get_group_id()
-        if group_id:
-            await self._apply_ban(event, qq, group_id, self._PERMA_MINUTES)
-        elif bool(self.config.get("delete_friend_on_private_ban", True)):
-            # 私聊：删除好友
-            try:
-                await event.bot.call_action("delete_friend", user_id=int(qq))
-                logger.info(f"AI守卫: 黑名单私聊用户已删好友 {qq}")
-            except BaseException as e:
-                logger.warning(f"AI守卫: 黑名单删好友失败 {qq}: {e}")
-        # 更新黑名单里的群号（可能在别的群再次被抓）
-        if group_id:
-            info["group_id"] = str(group_id)
-            self._save_blacklist()
-        report_group = str(self.config.get("report_group", "") or "").strip()
-        if report_group:
-            try:
-                await self.context.send_message(
-                    self._target_session(report_group, event),
-                    MessageChain().message(
-                        f"🚫 黑名单用户 QQ {qq}{(' (' + (info.get('name') or '') + ')' if info.get('name') else '')} 再次辱骂，"
-                        f"已自动续期禁言 30 天"
-                    ),
-                )
-            except BaseException:
-                logger.exception("AI守卫: 黑名单续期上报失败")
+        # 私聊：删除好友（删了自然发不进来）
+        if not bool(self.config.get("delete_friend_on_private_ban", True)):
+            return
+        try:
+            await event.bot.call_action("delete_friend", user_id=int(qq))
+            logger.info(f"AI守卫: 黑名单私聊用户已删好友 {qq}")
+        except BaseException as e:
+            logger.warning(f"AI守卫: 黑名单删好友失败 {qq}: {e}")
 
     @staticmethod
     def _group_id_from_session(session: str) -> str | None:
