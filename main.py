@@ -521,7 +521,7 @@ class Main(Star):
         - 你不确定是否真的是攻击
 
         Args:
-            severity(number): 攻击强度 0-10，必须达到跳过阈值（skip_sensitivity 滑杆，默认群聊 7/私聊 5）才会跳过
+            severity(number): 攻击强度 0-10，必须达到跳过阈值（skip_sensitivity 滑杆，默认群聊 5/私聊 3）才会跳过
             reason(string): 攻击原因，一句话说明
             attack_type(string): 攻击类型，填 "abuse"（辱骂）或 "injection"（注入）
         """
@@ -536,7 +536,7 @@ class Main(Star):
                 skip_enabled = bool(self.config.get("skip_inject_enabled", True))
             else:
                 skip_enabled = bool(self.config.get("skip_reply_enabled", True))
-            # 严格阈值：skip_sensitivity 滑杆（默认群聊 7、私聊 5），只有非常确定才跳
+            # 严格阈值：skip_sensitivity 滑杆（默认群聊 5、私聊 3），宁可不跳也不错杀
             skip_threshold = self._skip_threshold_for(key)
             if not skip_enabled:
                 context = self._get_context(key)
@@ -1315,7 +1315,7 @@ class Main(Star):
 
         与 sensitivity（上报敏感度）分开：跳过是更重的动作（当面打断 AI 回复），
         默认比上报更严。
-        skip_sensitivity: 0 → 10（只跳过极端恶劣）; 0.5 → 7（持续辱骂）; 1 → 4（认真不满就跳）。
+        skip_sensitivity: 0 → 10（只跳过极端恶劣）; 0.5 → 5（明确人身攻击）; 1 → 1（认真不满就跳）。
         私聊自动降 2（私聊对象就是 AI）。
         """
         try:
@@ -1326,7 +1326,7 @@ class Main(Star):
         except (TypeError, ValueError):
             sens = 0.5
         sens = max(0.0, min(1.0, sens))
-        threshold = max(1, min(10, int(10 - sens * 6 + 0.5)))
+        threshold = max(1, min(10, int(10 - sens * 10 + 0.5)))
         if self._is_private_key(key):
             threshold = max(1, threshold - 2)
         return threshold

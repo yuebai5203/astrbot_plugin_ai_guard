@@ -440,15 +440,15 @@ class TestSkipTool(unittest.TestCase):
         return asyncio.run(p.ai_guard_skip(ev, severity, reason, attack_type))
 
     def test_skip_threshold_map(self):
-        """skip_sensitivity 滑杆仍生效：群聊 0→10, 0.5→7, 1→4；私聊自动降 2。"""
+        """skip_sensitivity 滑杆生效：群聊 0→10, 0.5→5, 1→1；私聊自动降 2。"""
         p = make_plugin()
-        self.assertEqual(p._skip_threshold_for("aiocqhttp:GroupMessage:123"), 7)
+        self.assertEqual(p._skip_threshold_for("aiocqhttp:GroupMessage:123"), 5)
         p2 = make_plugin({"skip_sensitivity": 0.0})
         self.assertEqual(p2._skip_threshold_for("aiocqhttp:GroupMessage:123"), 10)
         p3 = make_plugin({"skip_sensitivity": 1.0})
-        self.assertEqual(p3._skip_threshold_for("aiocqhttp:GroupMessage:123"), 4)
+        self.assertEqual(p3._skip_threshold_for("aiocqhttp:GroupMessage:123"), 1)
         p4 = make_plugin()
-        self.assertEqual(p4._skip_threshold_for("aiocqhttp:FriendMessage:123"), 5)
+        self.assertEqual(p4._skip_threshold_for("aiocqhttp:FriendMessage:123"), 3)
 
     def test_above_threshold_skips_and_reports(self):
         """severity=9 >= 群聊阈值7 → 先上报再跳过。"""
@@ -460,10 +460,10 @@ class TestSkipTool(unittest.TestCase):
         self.assertTrue(any("跳过" in s for s in ev.sent))
 
     def test_below_threshold_reports_only(self):
-        """severity=5 < 阈值7 → 只上报不跳过。"""
+        """severity=4 < 默认阈值5 → 只上报不跳过。"""
         p = self._plugin()
         ev = self._mk_ev()
-        msg = self._run(p, ev, 5)
+        msg = self._run(p, ev, 4)
         p._report.assert_awaited_once()
         self.assertFalse(ev.stopped)
         self.assertIn("未达跳过阈值", msg)

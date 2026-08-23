@@ -230,10 +230,10 @@ def main():
     check("I skip9 已跳过", ev.stopped, "未跳过")
     check("I skip9 发提示", "跳过" in getattr(ev, "sent_text", ""), getattr(ev, "sent_text", ""))
 
-    # ---- 链路 J：ai_guard_skip severity=5 → 只上报不跳过 ----
+    # ---- 链路 J：ai_guard_skip severity=4（低于默认阈值5）→ 只上报不跳过 ----
     reports0 = p._stats["reports"]
     ev = FakeEvent(text="你又骂我", group_id="777007")
-    msg = run(p.ai_guard_skip(ev, 5, "轻度", "abuse"))
+    msg = run(p.ai_guard_skip(ev, 4, "轻度", "abuse"))
     check("J skip5 只上报", p._stats["reports"] > reports0 and not ev.stopped, msg)
     check("J skip5 提示未达阈值", "未达跳过阈值" in msg, msg)
 
