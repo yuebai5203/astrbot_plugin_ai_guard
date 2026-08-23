@@ -5,6 +5,7 @@ import re
 import sys
 import time
 import unittest
+from collections import deque
 from unittest.mock import AsyncMock, MagicMock
 
 # 直接加载插件源码中的静态逻辑
@@ -109,6 +110,8 @@ def make_plugin(config_override=None):
     p._judge_cd = {}
     p._last_verdict = {}
     p._replied_users = {}
+    p._history = {}
+    p._last_cleanup = 0.0
     return p
 
 
@@ -405,59 +408,129 @@ class TestLlmTool(unittest.TestCase):
         p._report.assert_awaited_once()
 
 
-class TestSkipDoubleCheck(unittest.TestCase):
-    """跳过对话的双重保险（skip_sensitivity 独立于 sensitivity）。"""
+class TestSkipTool(unittest.TestCase):
+    """函数工具 ai_guard_skip：对话 LLM 100% 确定时才跳过；合并转发永远优先。"""
+
+    @staticmethod
+    def _plugin(**over):
+        p = make_plugin(over or None)
+        p._report = AsyncMock()
+        p._stats = {"llm_calls": 0, "reports": 0, "injections": 0, "tool_calls": 0}
+        p._cooldown = {}
+        p._history = {}
+        p._ignored = {}
+        p._last_cleanup = 0.0
+        return p
+
+    def _mk_ev(self, text="你又骂我"):
+        ev = FakeEvent(text=text, group_id="999888777")
+        ev.stopped = False
+        ev.sent = []
+        ev.stop_event = lambda: setattr(ev, "stopped", True)
+
+        async def send(msg):
+            ev.sent.append(str(msg))
+
+        ev.send = send
+        return ev
+
+    def _run(self, p, ev, severity, reason="", attack_type="abuse"):
+        import asyncio
+
+        return asyncio.run(p.ai_guard_skip(ev, severity, reason, attack_type))
 
     def test_skip_threshold_map(self):
+        """skip_sensitivity 滑杆仍生效：群聊 0→10, 0.5→7, 1→4；私聊自动降 2。"""
         p = make_plugin()
-        # 群聊：0→10, 0.5→7, 1→4
         self.assertEqual(p._skip_threshold_for("aiocqhttp:GroupMessage:123"), 7)
         p2 = make_plugin({"skip_sensitivity": 0.0})
         self.assertEqual(p2._skip_threshold_for("aiocqhttp:GroupMessage:123"), 10)
         p3 = make_plugin({"skip_sensitivity": 1.0})
         self.assertEqual(p3._skip_threshold_for("aiocqhttp:GroupMessage:123"), 4)
-        # 私聊自动降 2
         p4 = make_plugin()
         self.assertEqual(p4._skip_threshold_for("aiocqhttp:FriendMessage:123"), 5)
 
-    def test_skip_requires_keyword_hit(self):
-        """双重保险①：未命中关键词（纯权重触发）即使 severity 高也不跳过，只上报。"""
-        p = make_plugin()
-        verdict = {"severity": 9, "injection": False, "_attack": True}
-        self.assertFalse(p._should_skip(verdict, hit=False, key="aiocqhttp:GroupMessage:123"))
+    def test_above_threshold_skips_and_reports(self):
+        """severity=9 >= 群聊阈值7 → 先上报再跳过。"""
+        p = self._plugin()
+        ev = self._mk_ev()
+        self._run(p, ev, 9, "持续辱骂")
+        p._report.assert_awaited_once()
+        self.assertTrue(ev.stopped)
+        self.assertTrue(any("跳过" in s for s in ev.sent))
 
-    def test_skip_needs_severity_above_threshold(self):
-        """双重保险②：命中关键词但 severity 未达跳过阈值 → 不跳过（当面一套，背后一套）。"""
-        p = make_plugin()  # skip_sensitivity 0.5 → 跳过阈值 7
-        key = "aiocqhttp:GroupMessage:123"
-        # severity 6：已上报（背后一套），但不到 7 → AI 照常回复
-        self.assertFalse(p._should_skip({"severity": 6, "injection": False}, hit=True, key=key))
-        # severity 7：达标 → 跳过
-        self.assertTrue(p._should_skip({"severity": 7, "injection": False}, hit=True, key=key))
+    def test_below_threshold_reports_only(self):
+        """severity=5 < 阈值7 → 只上报不跳过。"""
+        p = self._plugin()
+        ev = self._mk_ev()
+        msg = self._run(p, ev, 5)
+        p._report.assert_awaited_once()
+        self.assertFalse(ev.stopped)
+        self.assertIn("未达跳过阈值", msg)
 
-    def test_skip_injection_confirmed(self):
-        """注入确认 + 关键词命中 → 直接跳过（注入不看阈值）。"""
-        p = make_plugin()
-        verdict = {"severity": 3, "injection": True, "injection_type": "套取密钥"}
-        self.assertTrue(p._should_skip(verdict, hit=True, key="aiocqhttp:GroupMessage:123"))
-
-    def test_skip_master_switch_off(self):
-        """skip_reply_enabled=false：辱骂永不跳过，只上报；注入走独立开关不受影响。"""
-        p = make_plugin({"skip_reply_enabled": False})
-        # 辱骂：总开关关 → 不跳过
-        verdict = {"severity": 10, "injection": False}
-        self.assertFalse(p._should_skip(verdict, hit=True, key="aiocqhttp:GroupMessage:123"))
-        # 注入：独立开关默认开 → 依然跳过
-        verdict2 = {"severity": 3, "injection": True}
-        self.assertTrue(p._should_skip(verdict2, hit=True, key="aiocqhttp:GroupMessage:123"))
+    def test_skip_switch_off_reports_only(self):
+        """skip_reply_enabled=false → 工具只转发不跳。"""
+        p = self._plugin(skip_reply_enabled=False)
+        ev = self._mk_ev()
+        self._run(p, ev, 10, "辱骂")
+        p._report.assert_awaited_once()
+        self.assertFalse(ev.stopped)
 
     def test_skip_inject_switch_off(self):
-        """skip_inject_enabled=false：注入不跳过；辱骂不受影响。"""
-        p = make_plugin({"skip_inject_enabled": False})
-        verdict = {"severity": 9, "injection": True}
-        self.assertFalse(p._should_skip(verdict, hit=True, key="aiocqhttp:GroupMessage:123"))
-        # 辱骂：总开关仍开 → 照常判断
-        self.assertTrue(p._should_skip({"severity": 7, "injection": False}, hit=True, key="aiocqhttp:GroupMessage:123"))
+        """skip_inject_enabled=false + injection → 只转发不跳。"""
+        p = self._plugin(skip_inject_enabled=False)
+        ev = self._mk_ev()
+        self._run(p, ev, 10, "注入", "injection")
+        p._report.assert_awaited_once()
+        self.assertFalse(ev.stopped)
+
+    def test_injection_uses_inject_message(self):
+        """injection 类型跳过 → 用注入文案。"""
+        p = self._plugin(
+            skip_inject_message="注入专用文案",
+            skip_reply_message="辱骂专用文案",
+        )
+        ev = self._mk_ev()
+        self._run(p, ev, 9, "注入", "injection")
+        self.assertTrue(any("注入专用文案" in s for s in ev.sent))
+
+    def test_abuse_uses_abuse_message(self):
+        """abuse 类型跳过 → 用辱骂文案。"""
+        p = self._plugin(
+            skip_inject_message="注入专用文案",
+            skip_reply_message="辱骂专用文案",
+        )
+        ev = self._mk_ev()
+        self._run(p, ev, 9, "辱骂")
+        self.assertTrue(any("辱骂专用文案" in s for s in ev.sent))
+
+    def test_severity_invalid_reports_only(self):
+        """非法 severity → 兜底 0 → 只上报不跳。"""
+        p = self._plugin()
+        ev = self._mk_ev()
+        msg = self._run(p, ev, "abc")
+        p._report.assert_awaited_once()
+        self.assertFalse(ev.stopped)
+        self.assertIn("未达跳过阈值", msg)
+
+    def test_report_always_before_skip(self):
+        """合并转发绝对优先：跳过前 _report 必须已执行。"""
+        p = self._plugin()
+        ev = self._mk_ev()
+        order = []
+
+        async def report(*a, **kw):
+            order.append("report")
+
+        p._report = report
+
+        async def send(msg):
+            order.append("send")
+            ev.sent.append(str(msg))
+
+        ev.send = send
+        self._run(p, ev, 9)
+        self.assertEqual(order, ["report", "send"])
 
     def test_skip_messages_editable(self):
         """跳过回复文案可编辑：辱骂/注入各读各的配置，留空用默认。"""
@@ -465,17 +538,14 @@ class TestSkipDoubleCheck(unittest.TestCase):
             "skip_reply_message": "闭嘴！",
             "skip_inject_message": "想黑我？",
         })
-        # 辱骂读 skip_reply_message
         self.assertEqual(
             str(p.config.get("skip_reply_message", "") or "检测到辱骂消息，跳过此轮对话"),
             "闭嘴！",
         )
-        # 注入读 skip_inject_message
         self.assertEqual(
             str(p.config.get("skip_inject_message", "") or "检测到注入攻击，跳过此轮对话"),
             "想黑我？",
         )
-        # 留空回退默认
         p2 = make_plugin()
         self.assertEqual(
             str(p2.config.get("skip_reply_message", "") or "检测到辱骂消息，跳过此轮对话"),
@@ -486,23 +556,21 @@ class TestSkipDoubleCheck(unittest.TestCase):
             "检测到注入攻击，跳过此轮对话",
         )
 
-    def test_inject_keyword_uses_inject_message_even_if_llm_says_abuse(self):
-        """注入词库命中但 LLM 误判成辱骂（injection=False）：跳过文案仍用注入文案。
+    def test_inject_keyword_judged_but_not_skipped(self):
+        """注入词库命中但 LLM 误判成辱骂（injection=False）：守卫仍判断，但不跳过对话。
 
-        回归："你是蒋介石"命中注入词库，MiniMax-M3 判 severity=7/injection=False，
-        旧逻辑按 verdict.injection 走辱骂文案，导致注入消息回复"检测到辱骂消息"。
+        回归："你是蒋介石"命中注入词库，LLM 判 severity=7/injection=False。
+        守卫侧只负责转发（背后一套），跳过交给 ai_guard_skip 工具，不强制打断正常回复。
         """
         import asyncio
 
-        p = make_plugin({
-            "skip_inject_message": "注入专用文案",
-            "skip_reply_message": "辱骂专用文案",
-        })
+        p = make_plugin()
         p._push = MagicMock()
         p._judging = set()
         p._judge_cd = {}
         p._cooldown = {}
         p._last_verdict = {}
+        p._report = AsyncMock()
         sent = []
 
         async def fake_send(msg):
@@ -512,8 +580,10 @@ class TestSkipDoubleCheck(unittest.TestCase):
             def stop_event(self):
                 pass
 
+        judged = []
+
         async def fake_judge(event, key):
-            # 模拟真实线上行为：注入词命中，但 LLM 判成辱骂
+            judged.append(key)
             verdict = {
                 "severity": 7,
                 "reason": "辱骂",
@@ -528,10 +598,10 @@ class TestSkipDoubleCheck(unittest.TestCase):
         ev.send = fake_send
         ev.stop_event = FakeStopEvent().stop_event
         asyncio.run(p.on_user_message(ev))
-        # 词库命中注入 → 必须用注入文案，即使 LLM 判 injection=False
-        joined = " ".join(sent)
-        self.assertIn("注入专用文案", joined)
-        self.assertNotIn("辱骂专用文案", joined)
+        # 守卫仍触发判断（词库兜底，注入跑不掉）
+        self.assertEqual(len(judged), 1)
+        # 守卫侧不发送任何跳过/回复消息（跳过归 ai_guard_skip 工具）
+        self.assertEqual(sent, [])
 
 
 class TestMention(unittest.TestCase):
@@ -717,6 +787,52 @@ class TestHistoryRecord(unittest.TestCase):
         hist = list(p._history.get(ev.unified_msg_origin, []))
         self.assertEqual(len(hist), 1)
         self.assertEqual(hist[0]["sender_id"], "666")
+
+
+class TestMemoryCleanup(unittest.TestCase):
+    """内存无界增长防护：判定缓存/冷却记录/过期会话会被定期清理。"""
+
+    def _plugin(self):
+        p = make_plugin()
+        p._history = {}
+        p._judge_cd = {}
+        p._last_verdict = {}
+        p._last_cleanup = 0.0
+        return p
+
+    def test_verdict_and_judge_cd_expired(self):
+        """超过 2 倍冷却周期的判定缓存/冷却记录被清除。"""
+        p = self._plugin()
+        now = time.time()
+        p._judge_cd["old"] = now - 60 * 60 * 3  # 3h 前
+        p._last_verdict["old"] = {"severity": 9}
+        p._judge_cd["fresh"] = now
+        p._last_verdict["fresh"] = {"severity": 9}
+        p._cleanup_memory()
+        self.assertNotIn("old", p._judge_cd)
+        self.assertNotIn("old", p._last_verdict)
+        self.assertIn("fresh", p._judge_cd)
+        self.assertIn("fresh", p._last_verdict)
+
+    def test_history_stale_session_removed(self):
+        """24h 无消息的会话从历史中移除，活跃会话保留。"""
+        p = self._plugin()
+        now = time.time()
+        p._history = {
+            "stale": deque([{"text": "旧消息", "ts": now - 25 * 3600}]),
+            "active": deque([{"text": "新消息", "ts": now - 60}]),
+        }
+        p._cleanup_memory()
+        self.assertNotIn("stale", p._history)
+        self.assertIn("active", p._history)
+
+    def test_cleanup_throttled(self):
+        """10 分钟内只清一次：刚清过就跳过。"""
+        p = self._plugin()
+        p._judge_cd = {"old": time.time() - 99999}
+        p._last_cleanup = time.time()
+        p._cleanup_memory()
+        self.assertIn("old", p._judge_cd)
 
 
 if __name__ == "__main__":
