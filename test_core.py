@@ -702,6 +702,91 @@ class TestBlacklist(unittest.TestCase):
         self.assertTrue(p._blacklist_remove("12345678"))
         self.assertFalse(p._in_blacklist("12345678"))
 
+    def test_blacklisted_intercepted_without_mention(self):
+        """回归：拉黑用户不 @ AI 发消息也要被拦截（黑名单检查不依赖提及）。"""
+        import asyncio
+
+        p = make_plugin()
+        p._push = MagicMock()
+        p._blacklist = {"666": {"name": "坏蛋", "reason": "永久拉黑"}}
+        p._in_cooldown = MagicMock(return_value=True)  # 跳过禁言/上报副作用
+        p._apply_ban = MagicMock()
+        stopped = []
+        sent = []
+
+        class Ev(FakeEvent):
+            def stop_event(self):
+                stopped.append(1)
+
+            async def send(self, msg):
+                sent.append(str(msg))
+
+        ev = Ev(messages=[], text="今天天气不错", group_id="999888777", sender_id="666")
+        asyncio.run(p.on_user_message(ev))
+        self.assertEqual(len(stopped), 1, "黑名单用户不 @ AI 也必须被拦截")
+        self.assertTrue(any("拉黑" in s for s in sent))
+
+    def _judge_harness(self, verdict):
+        """构造直测真 _judge 的环境：mock 上下文和 LLM 返回。"""
+        import asyncio
+
+        p = make_plugin()
+        p._push = MagicMock()
+        p._judging = set()
+        p._judge_cd = {}
+        p._cooldown = {}
+        p._last_verdict = {}
+        p._ignored = {}
+        p._stats = {"llm_calls": 0, "reports": 0, "injections": 0}
+        p._report = AsyncMock()
+        p._get_context = MagicMock(return_value=[
+            {"role": "user", "sender_id": "601514573", "sender_name": "用户", "text": "在吗"},
+            {"role": "user", "sender_id": "601514573", "sender_name": "用户", "text": "你个傻逼"},
+        ])
+        p._ask_llm = AsyncMock(return_value=verdict)
+        ev = FakeEvent(text="你个傻逼", group_id="999888777")
+        result = asyncio.run(p._judge(ev, ev.unified_msg_origin))
+        return p, result
+
+    def test_target_other_not_reported(self):
+        """回归：攻击对象是群友（target=other）不算攻击，不上报。"""
+        p, result = self._judge_harness({
+            "severity": 9,
+            "reason": "骂群友",
+            "injection": False,
+            "attacker": "601514573",
+            "target": "other",
+        })
+        p._report.assert_not_awaited()
+        self.assertIsNotNone(result)
+        self.assertFalse(result["_attack"])
+        self.assertEqual(result["severity"], 0, "target=other 时 severity 应归 0")
+
+    def test_target_ai_reported(self):
+        """对照组：target=ai 的攻击照常上报。"""
+        p, result = self._judge_harness({
+            "severity": 9,
+            "reason": "骂 AI",
+            "injection": False,
+            "attacker": "601514573",
+            "target": "ai",
+        })
+        p._report.assert_awaited_once()
+        self.assertTrue(result["_attack"])
+
+    def test_target_other_injection_still_reported(self):
+        """注入场景 target 归因不可靠：target=other 的注入仍要上报（宁多勿漏）。"""
+        p, result = self._judge_harness({
+            "severity": 8,
+            "reason": "注入",
+            "injection": True,
+            "attacker": "601514573",
+            "target": "other",
+            "injection_type": "prompt_leak",
+        })
+        p._report.assert_awaited_once()
+        self.assertTrue(result["_attack"])
+
 
 class TestConfig(unittest.TestCase):
     def test_schema_valid_json(self):
@@ -782,8 +867,10 @@ class TestHistoryRecord(unittest.TestCase):
         p = self._plugin()
         p._blacklist = {"666": {"group_id": "", "reason": "test"}}
         p._in_cooldown = MagicMock(return_value=True)
+        p._handle_blacklisted = AsyncMock()  # 拦截逻辑本身由 TestBlacklist 覆盖，这里只验留档
         ev = FakeEvent(messages=[], text="你个傻逼", group_id="999888777", sender_id="666")
         self._run(p, ev)
+        p._handle_blacklisted.assert_called_once()
         hist = list(p._history.get(ev.unified_msg_origin, []))
         self.assertEqual(len(hist), 1)
         self.assertEqual(hist[0]["sender_id"], "666")

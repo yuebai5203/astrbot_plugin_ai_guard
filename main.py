@@ -146,12 +146,12 @@ class Main(Star):
             sender_name=event.get_sender_name() or event.get_sender_id() or "用户",
             text=text,
         )
-        # 群聊中只有 @ 了 bot 或提起 AI 才检测（避免群友互喷被突兀拦截）
-        if not self._mentioned_ai(event, text):
-            return
-        # 黑名单用户：不调 LLM，直接拦截 + 续期禁言 + 冷却上报
+        # 黑名单用户：不调 LLM，直接拦截 + 续期禁言 + 冷却上报（不依赖是否 @ AI）
         if self._in_blacklist(event.get_sender_id()):
             await self._handle_blacklisted(event, text)
+            return
+        # 群聊中只有 @ 了 bot 或提起 AI 才检测（避免群友互喷被突兀拦截）
+        if not self._mentioned_ai(event, text):
             return
         hit_abuse = self._hit_keywords(text)
         hit_inject = self._hit_inject_keywords(text)
@@ -253,7 +253,15 @@ class Main(Star):
             self._last_verdict[key] = result
             severity = result.get("severity", 0)
             injection = bool(result.get("injection", False))
+            target = str(result.get("target") or "ai").lower()
             threshold = self._threshold_for(key)
+            # 攻击对象不是 AI（群友互喷/骂第三方）：不算攻击，不转发。
+            # 注入除外——注入是操纵指令，归因不可靠，宁多勿漏仍按注入处理。
+            if not injection and target == "other":
+                result["_attack"] = False
+                result["severity"] = 0
+                logger.info(f"AI守卫: 攻击对象非 AI（target=other），不转发 ({key})")
+                return result
             # 标记是否攻击：注入不看阈值，辱骂看 severity 阈值
             result["_attack"] = injection or severity >= threshold
             logger.info(
