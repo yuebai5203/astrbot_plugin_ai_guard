@@ -89,10 +89,10 @@
     "hint": "上报冷却（分钟）：同会话冷却期内不重复上报"
   },
   "ban_default_minutes": {
-    "description": "默认禁言时长",
+    "description": "默认临时屏蔽时长",
     "type": "int",
     "default": 60,
-    "hint": "默认禁言时长（分钟）。确认时可跟数字覆盖，如「好 120」"
+    "hint": "回复「好」时默认临时屏蔽（AI 不接收其消息）的分钟数，可跟数字覆盖，如「好 120」；到期自动解除"
   },
   "skip_reply_enabled": {
     "description": "跳过响应开关",
@@ -130,16 +130,10 @@
     "hint": "跳过判定阈值（滑杆左松右严）：需关键词命中 + 评分达标才跳过"
   },
   "delete_friend_on_private_ban": {
-    "description": "私聊拉黑删好友",
+    "description": "私聊永久屏蔽删好友",
     "type": "bool",
     "default": true,
-    "hint": "私聊拉黑时同步删除好友"
-  },
-  "blacklist_reply_message": {
-    "description": "黑名单提示语",
-    "type": "string",
-    "default": "您已被永久拉黑，无法与 AI 对话",
-    "hint": "黑名单用户被拦截时的提示文案"
+    "hint": "私聊被永久屏蔽（ban）时同步删除好友；临时屏蔽不删好友"
   },
   "confirm_timeout_minutes": {
     "description": "确认有效期",

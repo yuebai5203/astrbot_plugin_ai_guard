@@ -1,10 +1,10 @@
 name: astrbot_plugin_ai_guard
 display_name: AI检测·守卫
-short_desc: AI 辱骂/阴阳怪气检测，合并转发上报管理群，支持拉黑禁言
+short_desc: AI 辱骂/阴阳怪气检测，合并转发上报管理群，支持屏蔽/黑名单
 desc: |
   对话 AI 在被辱骂/阴阳怪气时主动调用函数工具（ai_guard_report）上报，守卫校验攻击强度后带聊天记录合并转发到管理群；辱骂/注入词库命中由守卫兜底判断。
-  支持攻击对象判定（骂群友不算）、注入检测、跳过对话、拉黑/禁言/删好友、黑名单、两档敏感度滑杆。
-version: 1.6.1
+  支持攻击对象判定（骂群友不算）、注入检测、跳过对话、屏蔽（临时/永久黑名单）、删好友、两档敏感度滑杆。
+version: 1.6.2
 author: yuebai
 repo: https://github.com/yuebai5203/astrbot_plugin_ai_guard
 astrbot_version: ">=4.24.1"
@@ -17,6 +17,6 @@ tags:
   - 辱骂检测
   - AI守卫
   - 拉黑
-  - 禁言
+  - 屏蔽
   - 注入检测
   - 安全

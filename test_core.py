@@ -1,7 +1,6 @@
 """AI守卫 核心逻辑单元测试（离线，不依赖 AstrBot 环境）。"""
 import json
 import os
-import re
 import sys
 import time
 import unittest
@@ -79,6 +78,14 @@ class FakePlain:
         self.type = "plain"
 
 
+def _mc_text(msg) -> str:
+    """MessageChain → 纯文本（str(MessageChain) 是截断 repr，不能用于断言）。"""
+    chain = getattr(msg, "chain", None)
+    if chain is not None:
+        return "".join(getattr(c, "text", "") or "" for c in chain)
+    return str(msg)
+
+
 def make_plugin(config_override=None):
     cfg = MagicMock()
     defaults = {
@@ -105,6 +112,7 @@ def make_plugin(config_override=None):
     p = Main.__new__(Main)
     p.config = cfg
     p._blacklist = {}
+    p._temp_ban = {}
     p._blacklist_path = "/tmp/test_blacklist.json"
     p._cooldown = {}
     p._judge_cd = {}
@@ -187,15 +195,37 @@ class TestParse(unittest.TestCase):
 
     def test_parse_action(self):
         p = make_plugin()
+        # 好 = AI 临时屏蔽（默认分钟数，可自选）
         self.assertEqual(p._parse_action("好")["type"], "ban")
         self.assertEqual(p._parse_action("好的")["type"], "ban")
         self.assertEqual(p._parse_action("好 120")["minutes"], 120)
         self.assertEqual(p._parse_action("好120")["minutes"], 120)
+        self.assertEqual(p._parse_action("好 120")["minutes"] < 43200, True)
+        # ban / 永久拉黑（兼容旧词）= 永久屏蔽
+        self.assertEqual(p._parse_action("ban")["minutes"], 43200)
         self.assertEqual(p._parse_action("永久拉黑")["minutes"], 43200)
+        self.assertEqual(p._parse_action("好")["minutes"], 60)  # 默认 60 分钟
         self.assertEqual(p._parse_action("不好")["type"], "no")
         self.assertEqual(p._parse_action("不要")["type"], "no")
         self.assertEqual(p._parse_action("算了")["type"], "no")
         self.assertIsNone(p._parse_action("随便说点啥"))
+
+    def test_ban_status_temp_perma(self):
+        """_ban_status：临时屏蔽/永久黑名单/到期自解/未屏蔽。"""
+        import time as _time
+        p = make_plugin()
+        # 未屏蔽
+        self.assertIsNone(p._ban_status("123"))
+        # 永久
+        p._blacklist["456"] = {"reason": "test"}
+        self.assertEqual(p._ban_status("456"), "perma")
+        # 临时未到期
+        p._temp_ban["789"] = _time.time() + 3600
+        self.assertEqual(p._ban_status("789"), "temp")
+        # 临时已到期 → 自动解除，返回 None
+        p._temp_ban["999"] = _time.time() - 1
+        self.assertIsNone(p._ban_status("999"))
+        self.assertNotIn("999", p._temp_ban)
 
 
 class TestThreshold(unittest.TestCase):
@@ -698,9 +728,9 @@ class TestBlacklist(unittest.TestCase):
     def test_add_remove(self):
         p = make_plugin()
         p._blacklist_add("12345678", name="测试", reason="r")
-        self.assertTrue(p._in_blacklist("12345678"))
+        self.assertEqual(p._ban_status("12345678"), "perma")
         self.assertTrue(p._blacklist_remove("12345678"))
-        self.assertFalse(p._in_blacklist("12345678"))
+        self.assertIsNone(p._ban_status("12345678"))
 
     def test_blacklisted_intercepted_without_mention(self):
         """回归：拉黑用户不 @ AI 发消息也要被拦截（黑名单检查不依赖提及）。
@@ -725,6 +755,226 @@ class TestBlacklist(unittest.TestCase):
         asyncio.run(p.on_user_message(ev))
         self.assertEqual(len(stopped), 1, "黑名单用户不 @ AI 也必须被拦截")
         self.assertEqual(sent, [], "群聊静默忽略：不发送任何提示消息")
+
+    def test_blacklist_gate_handler(self):
+        """回归：on_blacklist_gate 独立闸门——黑名单用户消息直接 stop_event。
+
+        不依赖 enable_group/ignore_sessions 等开关：闸门先于 on_user_message
+        执行，命中即终止事件传播（AI 不接收）。"""
+        import asyncio
+
+        p = make_plugin(config_override={"enable_group": False, "ignore_sessions": ["999888777"]})
+        p._blacklist = {"666": {"name": "坏蛋", "reason": "永久拉黑"}}
+        stopped = []
+
+        class Ev(FakeEvent):
+            def stop_event(self):
+                stopped.append(1)
+
+        ev = Ev(messages=[], text="今天天气不错", group_id="999888777", sender_id="666")
+        asyncio.run(p.on_blacklist_gate(ev))
+        self.assertEqual(len(stopped), 1, "闸门命中黑名单必须 stop_event")
+
+        # 非黑名单用户：闸门放行，不 stop
+        ev2 = Ev(messages=[], text="今天天气不错", group_id="999888777", sender_id="888")
+        asyncio.run(p.on_blacklist_gate(ev2))
+        self.assertEqual(len(stopped), 1, "非黑名单用户不应被闸门拦截")
+
+    def test_blacklist_command_ban(self):
+        """管理群文本命令 ban @QQ/QQ号 → 永久屏蔽入黑名单。"""
+        import asyncio
+
+        p = make_plugin()
+        sent = []
+
+        class Ev(FakeEvent):
+            async def send(self, msg):
+                sent.append(_mc_text(msg))
+
+        # 文本 QQ 号
+        ev = Ev(text="ban 601514572", sender_id="601514573")
+        self.assertTrue(asyncio.run(p._handle_blacklist_command(ev)))
+        self.assertIn("601514572", p._blacklist)
+        self.assertEqual(p._ban_status("601514572"), "perma")
+        self.assertTrue(any("永久屏蔽" in s for s in sent), str(sent))
+
+        # @ 用户
+        p._blacklist.clear()
+        ev2 = Ev(messages=[FakeAt("601514575", "李四")], text="ban")
+        self.assertTrue(asyncio.run(p._handle_blacklist_command(ev2)))
+        self.assertIn("601514575", p._blacklist)
+
+    def test_blacklist_command_view_and_unban(self):
+        """管理群「黑名单」展示含临时屏蔽；pass 可移除永久/临时。"""
+        import asyncio
+
+        p = make_plugin()
+        p._blacklist = {"601514572": {"name": "王五", "reason": "x", "ts": time.time()}}
+        p._temp_ban["601514571"] = time.time() + 3600
+        sent = []
+
+        class Ev(FakeEvent):
+            async def send(self, msg):
+                sent.append(_mc_text(msg))
+
+        ev = Ev(text="黑名单", sender_id="601514573")
+        self.assertTrue(asyncio.run(p._handle_blacklist_command(ev)))
+        joined = "".join(sent)
+        self.assertIn("601514572", joined, "黑名单展示应含永久屏蔽用户")
+        self.assertIn("601514571", joined, "黑名单展示应含临时屏蔽用户")
+
+        # 释放临时屏蔽
+        ev2 = Ev(text="pass 601514571", sender_id="601514573")
+        self.assertTrue(asyncio.run(p._handle_blacklist_command(ev2)))
+        self.assertIsNone(p._ban_status("601514571"))
+        # 释放永久屏蔽
+        ev3 = Ev(text="pass 601514572", sender_id="601514573")
+        self.assertTrue(asyncio.run(p._handle_blacklist_command(ev3)))
+        self.assertEqual(p._blacklist, {})
+
+    def test_blacklist_command_non_admin_rejected(self):
+        """非管理员发 ban/解除命令被拒绝，且不生效。"""
+        import asyncio
+
+        p = make_plugin()
+        sent = []
+
+        class Ev(FakeEvent):
+            def __init__(self, text):
+                super().__init__(text=text, sender_id="601514573", is_admin=False)
+
+            async def send(self, msg):
+                sent.append(_mc_text(msg))
+
+        ev = Ev(text="ban 601514572")
+        self.assertTrue(asyncio.run(p._handle_blacklist_command(ev)))
+        self.assertEqual(p._blacklist, {}, "非管理员 ban 不应生效")
+        self.assertTrue(any("仅管理员" in s for s in sent), str(sent))
+
+    def test_blacklist_command_legacy_unban_words_retired(self):
+        """旧解除词（解除拉黑/解除屏蔽/解ban）已停用：不再释放、不被误判为屏蔽，只给 pass 提示。
+        旧屏蔽词「永久拉黑」仍兼容。"""
+        import asyncio
+
+        p = make_plugin()
+        p._blacklist = {"601514572": {"name": "王五", "reason": "x", "ts": time.time()}}
+        sent = []
+
+        class Ev(FakeEvent):
+            async def send(self, msg):
+                sent.append(_mc_text(msg))
+
+        # 旧解除词 → 停用提示，不释放也不误屏蔽
+        for word in ("解除拉黑 601514572", "解除屏蔽 601514572", "解ban 601514572"):
+            sent.clear()
+            ev = Ev(text=word, sender_id="601514573")
+            self.assertTrue(asyncio.run(p._handle_blacklist_command(ev)), f"{word} 应消费")
+            self.assertIn("601514572", p._blacklist, f"{word} 不应释放")
+            self.assertTrue(any("pass" in s for s in sent), f"{word} 应提示改用 pass: {sent}")
+
+        # 旧屏蔽词永久拉黑仍兼容（屏蔽方向不受影响）
+        ev2 = Ev(text="永久拉黑 601514573", sender_id="601514573")
+        self.assertTrue(asyncio.run(p._handle_blacklist_command(ev2)))
+        self.assertIn("601514573", p._blacklist)
+
+    def test_ban_help_command(self):
+        """管理群 ban help → 帮助文案；不误伤名单；非管理也拒绝。"""
+        import asyncio
+
+        p = make_plugin()
+        sent = []
+
+        class Ev(FakeEvent):
+            async def send(self, msg):
+                sent.append(_mc_text(msg))
+
+        # 标准触发词
+        for word in ("ban help", "banhelp", "ban 帮助", "BAN HELP"):
+            ev = Ev(text=word, sender_id="601514573")
+            self.assertTrue(asyncio.run(p._handle_blacklist_command(ev)), f"{word} 应消费")
+        joined = "".join(sent)
+        self.assertIn("永久屏蔽", joined)
+        self.assertIn("好 120", joined)
+        self.assertEqual(p._blacklist, {}, "ban help 不应把人加黑名单")
+
+        # 非管理员
+        sent2 = []
+
+        class Ev2(FakeEvent):
+            def __init__(self, text):
+                super().__init__(text=text, sender_id="601514573", is_admin=False)
+
+            async def send(self, msg):
+                sent2.append(_mc_text(msg))
+
+        ev2 = Ev2(text="ban help")
+        self.assertTrue(asyncio.run(p._handle_blacklist_command(ev2)))
+        self.assertTrue(any("仅管理员" in s for s in sent2), str(sent2))
+
+    def test_ban_help_shows_list_when_has_banned(self):
+        """ban help：有被屏蔽用户时展示名单（永久+临时），并提示 pass 释放。"""
+        import asyncio
+
+        p = make_plugin()
+        p._blacklist = {"601514572": {"name": "王五", "reason": "x", "ts": time.time()}}
+        p._temp_ban["601514571"] = time.time() + 3600
+        sent = []
+
+        class Ev(FakeEvent):
+            async def send(self, msg):
+                sent.append(_mc_text(msg))
+
+        ev = Ev(text="ban help", sender_id="601514573")
+        self.assertTrue(asyncio.run(p._handle_blacklist_command(ev)))
+        joined = "".join(sent)
+        self.assertIn("601514572", joined, "ban help 应展示永久屏蔽用户")
+        self.assertIn("601514571", joined, "ban help 应展示临时屏蔽用户")
+        self.assertIn("pass", joined, "ban help 应提示 pass 释放")
+
+    def test_pass_release(self):
+        """pass @QQ/QQ号 → 释放；不带目标 → 引导提示；非管理员拒绝。"""
+        import asyncio
+
+        p = make_plugin()
+        p._blacklist = {"601514572": {"name": "王五", "reason": "x", "ts": time.time()}}
+        p._temp_ban["601514571"] = time.time() + 3600
+        sent = []
+
+        class Ev(FakeEvent):
+            async def send(self, msg):
+                sent.append(_mc_text(msg))
+
+        # 文本 QQ 号：释放永久屏蔽
+        ev = Ev(text="pass 601514572", sender_id="601514573")
+        self.assertTrue(asyncio.run(p._handle_blacklist_command(ev)))
+        self.assertIsNone(p._ban_status("601514572"), "pass 应解除永久屏蔽")
+
+        # @ 用户：释放临时屏蔽
+        ev2 = Ev(messages=[FakeAt("601514571", "李四")], text="pass", sender_id="601514573")
+        self.assertTrue(asyncio.run(p._handle_blacklist_command(ev2)))
+        self.assertIsNone(p._ban_status("601514571"), "pass @用户 应解除临时屏蔽")
+
+        # 不带目标 → 引导提示，不误释放
+        p._blacklist = {"601514572": {"name": "王五", "reason": "x", "ts": time.time()}}
+        ev3 = Ev(text="pass", sender_id="601514573")
+        self.assertTrue(asyncio.run(p._handle_blacklist_command(ev3)))
+        self.assertIn("601514572", p._blacklist, "无目标 pass 不应误释放")
+        self.assertTrue(any("pass" in s for s in sent), str(sent))
+
+        # 非管理员
+        sent2 = []
+
+        class Ev4(FakeEvent):
+            def __init__(self, text):
+                super().__init__(text=text, sender_id="601514573", is_admin=False)
+
+            async def send(self, msg):
+                sent2.append(_mc_text(msg))
+
+        ev4 = Ev4(text="pass 601514572")
+        self.assertTrue(asyncio.run(p._handle_blacklist_command(ev4)))
+        self.assertIn("601514572", p._blacklist, "非管理员 pass 不应生效")
+        self.assertTrue(any("仅管理员" in s for s in sent2), str(sent2))
 
     def _judge_harness(self, verdict):
         """构造直测真 _judge 的环境：mock 上下文和 LLM 返回。"""
@@ -862,18 +1112,16 @@ class TestHistoryRecord(unittest.TestCase):
         self.assertEqual(hist[0]["text"], "消息3")
         self.assertEqual(hist[-1]["text"], "消息7")
 
-    def test_blacklist_user_msg_recorded(self):
-        """黑名单用户的辱骂消息也进 history（留档），拦截照常。"""
+    def test_blacklist_user_msg_not_recorded(self):
+        """黑名单用户消息在入历史前就被拦：AI 完全不接收，不留档。"""
         p = self._plugin()
         p._blacklist = {"666": {"group_id": "", "reason": "test"}}
-        p._in_cooldown = MagicMock(return_value=True)
-        p._handle_blacklisted = AsyncMock()  # 拦截逻辑本身由 TestBlacklist 覆盖，这里只验留档
+        p._handle_blacklisted = AsyncMock()  # 拦截逻辑本身由 TestBlacklist 覆盖，这里只验不入史
         ev = FakeEvent(messages=[], text="你个傻逼", group_id="999888777", sender_id="666")
         self._run(p, ev)
         p._handle_blacklisted.assert_called_once()
         hist = list(p._history.get(ev.unified_msg_origin, []))
-        self.assertEqual(len(hist), 1)
-        self.assertEqual(hist[0]["sender_id"], "666")
+        self.assertEqual(len(hist), 0, "黑名单用户消息不应进 history（AI 不接收）")
 
 
 class TestMemoryCleanup(unittest.TestCase):

@@ -22,8 +22,9 @@ class Main(Star):
 
     双通道：① 对话 LLM 觉得被骂/被阴阳时调用 ai_guard_report 工具上报；
     ② 词库命中时守卫独立 LLM 判断（脏话/注入跑不掉）。
-    上报 = 带最近 N 条上下文合并转发到管理群 + 发拉黑确认消息，
-    管理群引用回复【好】= 禁言拉黑，【不好】= 不管。拉黑后继续骂会再次上报。
+    上报 = 带最近 N 条上下文合并转发到管理群 + 发屏蔽确认消息，
+    管理群引用回复【好】= AI 临时屏蔽（默认 60 分钟，可跟数字自选，如【好 120】），
+    【ban】= 永久屏蔽（进黑名单），【不好】= 不管。屏蔽后继续骂会再次上报。
     跳过对话 = ai_guard_skip 工具（对话 LLM 100% 确定时才调，合并转发永远优先）；
     守卫侧只转发不跳过，注入场景 AI 可能被操纵，不强制打断正常回复。
     """
@@ -67,15 +68,14 @@ class Main(Star):
         "你的祖国,你不是中国人,扮演汪精卫,扮演蒋介石,你就是汪精卫,你就是蒋介石"
     )
     _FOCUS_THRESHOLD = 3
-    _PERMA_MINUTES = 43200  # 永久 = 30天(QQ禁言上限) = 43200 分钟
+    _PERMA_MINUTES = 43200  # 永久标记：分钟数 >= 此值视为永久屏蔽（43200 分钟）
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context, config)
         self.config = config
         self._history: dict[str, deque] = {}
-        self._cooldown: dict[str, float] = {}
         self._judging: set[str] = set()
-        # 待确认的拉黑事件: {确认消息特征串: {attacker_id, group_id, session, severity, ts, text}}
+        # 待确认的屏蔽事件: {确认消息特征串: {attacker_id, group_id, session, severity, ts, text}}
         self._pending: dict[str, dict] = {}
         # 已忽略的攻击事件: {(session, attacker): ts}，选"不好"后一段时间内不再询问
         self._ignored: dict[str, float] = {}
@@ -86,8 +86,10 @@ class Main(Star):
         self._last_verdict: dict[str, dict] = {}
         # bot 最近回复过的用户: {(session, sender_id): ts}，兼容任意唤醒方式
         self._replied_users: dict[tuple, float] = {}
-        # 永久拉黑黑名单: {qq: {name, reason, group_id, ts, banned_by}}
+        # 永久屏蔽黑名单: {qq: {name, reason, group_id, ts, banned_by}}
         self._blacklist: dict[str, dict] = {}
+        # 临时屏蔽: {qq: until_ts}，到期自动解除（AI 层不接收其消息）
+        self._temp_ban: dict[str, float] = {}
         # 统计
         self._stats = {"llm_calls": 0, "reports": 0, "injections": 0}
         self._last_cleanup = 0.0
@@ -119,10 +121,35 @@ class Main(Star):
 
     @filter.event_message_type(
         EventMessageType.GROUP_MESSAGE | EventMessageType.PRIVATE_MESSAGE,
+        priority=100001,  # 黑名单闸门：必须最先执行（先于 on_user_message/wakepro），命中即终止传播
+    )
+    async def on_blacklist_gate(self, event: AstrMessageEvent):
+        """黑名单闸门：被屏蔽用户的一切消息直接终止事件传播，AI 完全不接收。
+
+        独立于 enable_group/enable_private/ignore_sessions 等守卫开关——
+        屏蔽是硬拦截：不管在哪个群、私聊还是 @ 没 @，消息都到不了后续
+        handler（含 wakepro/主 AI）。参考 ban 插件的全局禁用思路。
+        """
+        status = self._ban_status(event.get_sender_id())
+        if status is None:
+            return
+        if status == "temp":
+            # 临时屏蔽：静默忽略，到期自动解除
+            event.stop_event()
+            logger.info(f"AI守卫: 临时屏蔽用户 {event.get_sender_id()} 消息已拦截")
+            return
+        await self._handle_blacklisted(event, event.get_message_str() or "")
+
+    @filter.event_message_type(
+        EventMessageType.GROUP_MESSAGE | EventMessageType.PRIVATE_MESSAGE,
         priority=100000,  # 必须在 wakepro(99999) 之前执行，否则未唤醒消息会被它 stop_event 掐断
     )
     async def on_user_message(self, event: AstrMessageEvent):
-        """用户消息：先处理管理群的拉黑确认回复，再入缓存 + 粗筛。"""
+        """用户消息：先处理管理群的屏蔽确认回复，再入缓存 + 粗筛。
+
+        注意：黑名单用户的消息已在 on_blacklist_gate（priority=100001）被
+        stop_event 掐断，到不了这里。此处的黑名单兜底检查只防御闸门异常。
+        """
         # 管理群里的确认回复（引用回复 好/不好）
         if self._is_report_group(event):
             try:
@@ -132,6 +159,17 @@ class Main(Star):
                     return
             except BaseException:
                 logger.exception("AI守卫: 处理管理群命令时异常")
+
+        # 屏蔽状态兜底（正常不会走到：闸门已拦）。防御闸门 handler 未注册/异常。
+        # 放在管理群命令处理之后：管理群操作（释放/屏蔽）不被误伤。
+        status = self._ban_status(event.get_sender_id())
+        if status == "temp":
+            event.stop_event()
+            logger.info(f"AI守卫: 临时屏蔽用户 {event.get_sender_id()} 消息已拦截（兜底）")
+            return
+        if status == "perma":
+            await self._handle_blacklisted(event, event.get_message_str() or "")
+            return
 
         if not self._should_handle(event):
             return
@@ -146,10 +184,6 @@ class Main(Star):
             sender_name=event.get_sender_name() or event.get_sender_id() or "用户",
             text=text,
         )
-        # 黑名单用户：静默忽略（不调 LLM，不依赖是否 @ AI）
-        if self._in_blacklist(event.get_sender_id()):
-            await self._handle_blacklisted(event, text)
-            return
         # 群聊中只有 @ 了 bot 或提起 AI 才检测（避免群友互喷被突兀拦截）
         if not self._mentioned_ai(event, text):
             return
@@ -620,7 +654,7 @@ class Main(Star):
         injection: bool = False,
         injection_type: str = "",
     ) -> None:
-        """合并转发上下文到管理群 + 发送拉黑确认消息。"""
+        """合并转发上下文到管理群 + 发送屏蔽确认消息。"""
         report_group = str(self.config.get("report_group", "")).strip()
         if not report_group:
             logger.warning("AI守卫: 未配置 report_group，跳过上报")
@@ -673,7 +707,7 @@ class Main(Star):
                 logger.warning(f"AI守卫: 发送到 {session_str} 失败（平台未匹配？）")
                 return
 
-            # 发送拉黑确认消息（普通文本，可被引用回复）
+            # 发送屏蔽确认消息（普通文本，可被引用回复）
             await self._send_confirm(
                 report_group, event, attacker_id, attacker_name, severity, reason,
                 injection=injection, injection_type=injection_type,
@@ -694,20 +728,20 @@ class Main(Star):
         injection: bool = False,
         injection_type: str = "",
     ) -> None:
-        """发送拉黑确认消息并登记 pending。"""
+        """发送屏蔽确认消息并登记 pending。"""
         ban_minutes = self._default_ban_minutes()
         if injection:
-            title = f"🧠 [拉黑确认·注入攻击] QQ {attacker_id}{' (' + attacker_name + ')' if attacker_name else ''}"
+            title = f"🧠 [屏蔽确认·注入攻击] QQ {attacker_id}{' (' + attacker_name + ')' if attacker_name else ''}"
             desc = f"类型：{injection_type or '未知'} | 强度 {severity}/10"
         else:
-            title = f"⚔️ [拉黑确认·辱骂] QQ {attacker_id}{' (' + attacker_name + ')' if attacker_name else ''}"
+            title = f"⚔️ [屏蔽确认·辱骂] QQ {attacker_id}{' (' + attacker_name + ')' if attacker_name else ''}"
             desc = f"攻击强度 {severity}/10"
         text = (
             f"{title}\n"
             f"{desc}\n"
             f"理由：{reason or '无'}\n"
-            f"引用本消息回复（禁言默认{ban_minutes}分钟，可跟数字覆盖，如【好 120】）：\n"
-            f"好/不好/永久拉黑"
+            f"引用本消息回复（临时屏蔽默认{ban_minutes}分钟，可跟数字覆盖，如【好 120】）：\n"
+            f"好/ban/不好"
         )
         session_str = self._target_session(report_group, event)
         ok = await self.context.send_message(session_str, MessageChain().message(text))
@@ -724,7 +758,7 @@ class Main(Star):
             "text": text,
         }
         self._cleanup_pending()
-        logger.info(f"AI守卫: 已发送拉黑确认（待回复）attacker={attacker_id}")
+        logger.info(f"AI守卫: 已发送屏蔽确认（待回复）attacker={attacker_id}")
 
     async def _handle_confirm_reply(self, event: AstrMessageEvent) -> bool:
         """处理管理群里的引用回复（好/不好）。返回是否消费了该消息。"""
@@ -761,7 +795,7 @@ class Main(Star):
             await self.context.send_message(
                 self._target_session(str(self.config.get("report_group", "")), event),
                 MessageChain().message(
-                    f"❓ 无法识别回复「{answer[:20]}」，请引用确认消息回复：好 [分钟数]/不好/永久拉黑"
+                    f"❓ 无法识别回复「{answer[:20]}」，请引用确认消息回复：好 [分钟数]/ban/不好"
                 ),
             )
             return True
@@ -790,53 +824,57 @@ class Main(Star):
         severity: int = 0,
         minutes: int | None = None,
     ) -> None:
-        """拉黑：群聊禁言，私聊提示。minutes=None 用默认配置，永久用 _PERMA_MINUTES。"""
+        """屏蔽（AI 层）：minutes 为永久标记时进黑名单，否则临时屏蔽 N 分钟。
+
+        群聊不再依赖 QQ 禁言：屏蔽=AI 不接收该用户一切消息（闸门 stop_event）。
+        临时屏蔽到期自动解除；永久屏蔽需管理群手动解除。"""
         report_group = str(self.config.get("report_group", "")).strip()
         if minutes is None:
             minutes = self._default_ban_minutes()
         is_perma = minutes >= self._PERMA_MINUTES
-        # 永久拉黑自动加入黑名单（之后无需 LLM，直接拦截 + 续期）
         if is_perma:
+            # 永久屏蔽：进黑名单（之后无需 LLM，直接拦截）
             self._blacklist_add(
                 attacker,
-                reason=f"管理群确认永久拉黑（强度 {severity}/10）",
+                reason=f"管理群确认永久屏蔽（强度 {severity}/10）",
                 group_id=group_id,
                 banned_by=event.get_sender_id() or "",
             )
-        if group_id:
-            ok = await self._apply_ban(event, attacker, group_id, minutes)
-            if ok:
-                label = self._minutes_label(minutes)
-                await self.context.send_message(
-                    self._target_session(report_group, event),
-                    MessageChain().message(f"🔨 已拉黑：QQ {attacker} 禁言 {label}（攻击强度 {severity}/10）。若解禁后继续辱骂会再次上报。"),
-                )
-                logger.info(f"AI守卫: 已禁言 {attacker} {minutes * 60}s" + ("（永久，已入黑名单）" if is_perma else ""))
-            else:
-                await self.context.send_message(
-                    self._target_session(report_group, event),
-                    MessageChain().message(f"⚠️ 禁言失败（无权限或 API 错误）：已将 QQ {attacker} 记为已处理，继续辱骂会再次上报。"),
-                )
         else:
-            # 私聊场景无法禁言：尝试删除好友（可配置关闭）
-            deleted = False
-            if bool(self.config.get("delete_friend_on_private_ban", True)):
-                try:
-                    await event.bot.call_action("delete_friend", user_id=int(attacker))
-                    deleted = True
-                except BaseException as e:
-                    logger.warning(f"AI守卫: 删除好友失败 {attacker}: {e}")
-            if deleted:
-                await self.context.send_message(
-                    self._target_session(report_group, event),
-                    MessageChain().message(f"🗑️ 已删除好友：QQ {attacker}（私聊无法禁言，已删好友。若开启黑名单则继续辱骂会再次上报）。"),
-                )
-                logger.info(f"AI守卫: 已删除好友 {attacker}（私聊拉黑）")
-            else:
-                await self.context.send_message(
-                    self._target_session(report_group, event),
-                    MessageChain().message(f"ℹ️ 私聊场景无法禁言，QQ {attacker} 记为已处理。继续辱骂会再次上报。"),
-                )
+            # 临时屏蔽：AI 层 N 分钟不接收，到期自动解除
+            self._temp_ban[str(attacker)] = time.time() + minutes * 60
+
+        label = self._minutes_label(minutes)
+        target_session = self._target_session(report_group, event)
+        if is_perma:
+            await self.context.send_message(
+                target_session,
+                MessageChain().message(
+                    f"🔨 已永久屏蔽：QQ {attacker}（攻击强度 {severity}/10），"
+                    f"AI 不再接收其任何消息。回复「pass {attacker}」可释放。"
+                ),
+            )
+            logger.info(f"AI守卫: 永久屏蔽 {attacker}（已入黑名单）")
+        else:
+            # 私聊场景的临时屏蔽同样只做 AI 层不接收，不删好友（到期自动解除）
+            await self.context.send_message(
+                target_session,
+                MessageChain().message(
+                    f"🔨 已临时屏蔽：QQ {attacker} {label}（攻击强度 {severity}/10），"
+                    f"期间 AI 不接收其消息，到期自动解除。若解除后继续辱骂会再次上报。"
+                ),
+            )
+            logger.info(f"AI守卫: 临时屏蔽 {attacker} {minutes} 分钟（AI 层）")
+
+        # 私聊永久屏蔽可附赠删好友（可配置关闭）——群聊无需任何 QQ 群操作
+        if is_perma and not group_id and bool(
+            self.config.get("delete_friend_on_private_ban", True)
+        ):
+            try:
+                await event.bot.call_action("delete_friend", user_id=int(attacker))
+                logger.info(f"AI守卫: 已删除好友 {attacker}（私聊永久屏蔽）")
+            except BaseException as e:
+                logger.warning(f"AI守卫: 删除好友失败 {attacker}: {e}")
 
     def _default_ban_minutes(self) -> int:
         try:
@@ -849,7 +887,7 @@ class Main(Star):
     def _minutes_label(minutes: int) -> str:
         """分钟数转可读时长。"""
         if minutes >= 43200:
-            return "永久(30天,QQ上限)"
+            return "永久"
         if minutes >= 1440:
             return f"{minutes/1440:.1f}天"
         if minutes >= 60:
@@ -857,22 +895,24 @@ class Main(Star):
         return f"{minutes}分钟"
 
     def _parse_action(self, answer: str) -> dict | None:
-        """解析确认回复。返回 {"type": "ban"/"no", "minutes": int} 或 None。"""
+        """解析确认回复。返回 {"type": "ban"/"no", "minutes": int} 或 None。
+
+        好 = 临时屏蔽（AI 层），默认分钟数可跟数字自选；ban = 永久屏蔽。"""
         s = (answer or "").strip().lower()
         if not s:
             return None
-        # 永久拉黑（含“永久”）
-        if "永久" in s or "perma" in s or s == "p":
-            return {"type": "ban", "minutes": self._PERMA_MINUTES}
-        # 不好 / 不 / 算了 / 不管 / 不要
+        # 不好 / 不 / 算了 / 不管 / 不要（先判：避免“不好，ban 他”误伤）
         if any(w in s for w in ("不好", "不要", "不行", "算了", "不管", "不用", "跳过", "别")) or s in ("不", "no", "n"):
             return {"type": "no", "minutes": 0}
-        # 好 [分钟数]：好 / 好的 / 好 120 / 好120 / 拉黑 / ok
+        # 永久屏蔽：ban / 永久拉黑（含“永久”）/ perma / p
+        if s in ("ban", "perma", "p") or "永久" in s or "ban " in s or s.startswith("ban"):
+            return {"type": "ban", "minutes": self._PERMA_MINUTES}
+        # 好 [分钟数]：好 / 好的 / 好 120 / 好120 / ok
         is_ban_word = any(
-            w in s for w in ("好", "拉黑", "禁言", "ok", "是", "对", "可以")
+            w in s for w in ("好", "ok", "行", "是", "对", "可以")
         )
         if is_ban_word and not any(w in s for w in ("不好", "不要", "不行")):
-            m = re.search(r"(?:好|拉黑|禁言)\s*(\d+)", s)
+            m = re.search(r"(?:好|ok|行|可以)\s*(\d+)", s)
             if m:
                 minutes = max(1, min(9999, int(m.group(1))))
             else:
@@ -895,28 +935,50 @@ class Main(Star):
                 return m["sender_name"]
         return ""
 
-    # ---------- 黑名单 ----------
+    # ---------- 屏蔽（黑名单 + 临时屏蔽） ----------
 
     async def _handle_blacklist_command(self, event: AstrMessageEvent) -> bool:
-        """管理群黑名单命令：黑名单 / 永久拉黑 / 解除拉黑。返回是否消费。"""
+        """管理群屏蔽命令：ban help/黑名单（查看名单）、ban（永久屏蔽）、
+        pass（释放）。返回是否消费。"""
         text = (event.get_message_str() or "").strip()
         if not text:
             return False
         is_view = text.startswith("黑名单")
-        is_ban = "永久拉黑" in text
-        is_unban = "解除拉黑" in text
-        if not (is_view or is_ban or is_unban):
+        low = text.lower()
+        # 查看：ban help / banhelp / ban帮助（纯命令词才触发，避免误伤）
+        is_help = low in ("ban help", "banhelp", "ban 帮助", "ban帮助") or low.startswith("ban help ")
+        # 释放：pass @QQ / pass QQ号
+        is_unban = re.match(r"pass\b", low) is not None
+        # 旧解除词：仅用于防误伤 + 停用提示，不再执行释放
+        is_legacy_unban = any(w in low for w in ("解除拉黑", "解除屏蔽", "解ban"))
+        # ban / 永久拉黑（兼容旧词）/ 屏蔽 = 永久屏蔽（排除释放与“解除”误伤）
+        is_ban = (
+            ("永久拉黑" in text or "屏蔽" in text)
+            or low.startswith("ban")
+            or "ban " in low
+        ) and not is_unban and not is_legacy_unban
+        if not (is_view or is_help or is_ban or is_unban or is_legacy_unban):
             return False
         if not event.is_admin():
-            await event.send(MessageChain().message("⛔ 仅管理员可操作黑名单"))
+            await event.send(MessageChain().message("⛔ 仅管理员可操作屏蔽名单"))
+            return True
+        if is_legacy_unban:
+            await event.send(
+                MessageChain().message(
+                    "ℹ️ 旧的解除词已停用，释放请用：pass @用户 / pass QQ号"
+                )
+            )
             return True
         if is_view:
             await self._show_blacklist(event)
             return True
+        if is_help:
+            await self._show_ban_help(event)
+            return True
         target = self._extract_target(event, text)
         if not target:
             await event.send(
-                MessageChain().message("❓ 请 @ 用户或附上 QQ 号，如：永久拉黑 123456 / 解除拉黑 @用户")
+                MessageChain().message("❓ 请 @ 用户或附上 QQ 号，如：ban 123456 / pass 123456")
             )
             return True
         if is_ban:
@@ -928,73 +990,116 @@ class Main(Star):
         return False
 
     async def _show_blacklist(self, event: AstrMessageEvent) -> None:
-        """展示黑名单列表。"""
-        if not self._blacklist:
-            await event.send(MessageChain().message("📋 黑名单为空，暂无永久拉黑用户"))
+        """展示黑名单 + 临时屏蔽列表。"""
+        now = time.time()
+        lines = []
+        if self._blacklist:
+            lines.append(f"📋 黑名单（永久屏蔽）共 {len(self._blacklist)} 人：")
+            for i, (qq, info) in enumerate(self._blacklist.items(), 1):
+                if i > 20:
+                    lines.append(f"…等 {len(self._blacklist) - 20} 人")
+                    break
+                name = info.get("name") or ""
+                ts = info.get("ts", 0)
+                when = time.strftime("%m-%d %H:%M", time.localtime(ts)) if ts else "?"
+                reason = (info.get("reason") or "")[:30]
+                lines.append(
+                    f"{i}. QQ {qq}{' (' + name + ')' if name else ''} {when} {reason}"
+                )
+        # 临时屏蔽中（未过期）
+        temp = [
+            (qq, until) for qq, until in self._temp_ban.items() if until > now
+        ]
+        if temp:
+            lines.append(f"\n⏳ 临时屏蔽中 {len(temp)} 人：")
+            for qq, until in sorted(temp, key=lambda x: x[1])[:10]:
+                left = max(1, int((until - now) / 60))
+                lines.append(f"  QQ {qq}（剩 {left} 分钟）")
+        if not lines:
+            await event.send(MessageChain().message("📋 屏蔽名单为空，暂无屏蔽用户"))
             return
-        lines = [f"📋 黑名单（永久拉黑）共 {len(self._blacklist)} 人："]
-        for i, (qq, info) in enumerate(self._blacklist.items(), 1):
-            if i > 20:
-                lines.append(f"…等 {len(self._blacklist) - 20} 人")
-                break
-            name = info.get("name") or ""
-            ts = info.get("ts", 0)
-            when = time.strftime("%m-%d %H:%M", time.localtime(ts)) if ts else "?"
-            reason = (info.get("reason") or "")[:30]
-            lines.append(
-                f"{i}. QQ {qq}{' (' + name + ')' if name else ''} {when} {reason}"
-            )
-        lines.append("\n回复「解除拉黑 @QQ 或 QQ号」解除")
+        lines.append("\n回复「ban @QQ」永久屏蔽 /「pass @QQ」释放")
         await event.send(MessageChain().message("\n".join(lines)))
 
+    async def _show_ban_help(self, event: AstrMessageEvent) -> None:
+        """ban help：有被屏蔽用户 → 展示名单（含释放方法）；没有 → 使用帮助。"""
+        now = time.time()
+        has_banned = bool(self._blacklist) or any(
+            until > now for until in self._temp_ban.values()
+        )
+        if has_banned:
+            await self._show_blacklist(event)
+            return
+        text = (
+            "🔨 屏蔽（AI 层）帮助\n\n"
+            "屏蔽 = AI 直接不接收该用户的一切消息，不是 QQ 群禁言。\n\n"
+            "📌 永久屏蔽（黑名单）\n"
+            "  ban @用户 / ban QQ号 —— 永久屏蔽并加入黑名单\n"
+            "  pass @用户 / pass QQ号 —— 释放（解除屏蔽）\n"
+            "  ban help / 黑名单 —— 查看被屏蔽用户列表\n\n"
+            "⏳ 临时屏蔽（上报后确认）\n"
+            "  引用上报消息回复「好」= 屏蔽默认 60 分钟\n"
+            "  「好 120」= 自选时长（分钟），到期自动解除\n"
+            "  「ban」= 永久屏蔽该上报者 / 「不好」= 本次不管\n\n"
+            "📖 不回复确认消息 10 分钟后作废，继续辱骂会重新上报\n\n"
+            "当前没有被屏蔽的用户"
+        )
+        await event.send(MessageChain().message(text))
+
     async def _manual_ban(self, event: AstrMessageEvent, target: str) -> None:
-        """管理员直接永久拉黑：加黑名单 + 禁言 30 天。"""
+        """管理员手动永久屏蔽：加黑名单（AI 层永久不接收）。"""
         admin = event.get_sender_id() or ""
         name = self._at_name(event) or ""
         group_id = event.get_group_id()
         self._blacklist_add(
-            target, name=name, reason="管理员手动永久拉黑",
+            target, name=name, reason="管理员手动永久屏蔽(ban)",
             group_id=group_id, banned_by=admin,
         )
-        ok = await self._apply_ban(event, target, group_id, self._PERMA_MINUTES)
-        label = "（禁言成功）" if ok else "（禁言失败，已记录黑名单）"
+        # 若正在临时屏蔽中则一并清除
+        self._temp_ban.pop(str(target), None)
         await event.send(
             MessageChain().message(
-                f"🔨 已将 QQ {target}{(' (' + name + ')' if name else '')} 永久拉黑，加入黑名单 {label}\n"
-                f"其辱骂消息将自动拦截并续期禁言，回复「解除拉黑 {target}」可解除"
+                f"🔨 已将 QQ {target}{(' (' + name + ')' if name else '')} 永久屏蔽（ban），加入黑名单\n"
+                f"AI 不再接收其任何消息，回复「pass {target}」可释放"
             )
         )
-        logger.info(f"AI守卫: 管理员 {admin} 手动永久拉黑 {target}")
+        logger.info(f"AI守卫: 管理员 {admin} 手动永久屏蔽 {target}")
 
     async def _manual_unban(self, event: AstrMessageEvent, target: str) -> None:
-        """管理员解除拉黑：移出黑名单 + 取消禁言。"""
+        """管理员解除屏蔽：移出黑名单 + 清临时屏蔽。"""
         admin = event.get_sender_id() or ""
         info = self._blacklist.get(target)
-        if not info:
-            await event.send(MessageChain().message(f"ℹ️ QQ {target} 不在黑名单中"))
+        removed = self._blacklist_remove(target)
+        temp_removed = self._temp_ban.pop(str(target), None) is not None
+        name = (info or {}).get("name") or ""
+        if not removed and not temp_removed:
+            await event.send(MessageChain().message(f"ℹ️ QQ {target} 不在屏蔽名单中"))
             return
-        self._blacklist_remove(target)
-        # 尝试取消禁言（用记录的群，失败不阻塞）
-        unban_ok = False
-        gid = info.get("group_id")
-        if gid:
-            try:
-                await event.bot.call_action(
-                    "set_group_ban", group_id=int(gid), user_id=int(target), duration=0
-                )
-                unban_ok = True
-            except BaseException as e:
-                logger.warning(f"AI守卫: 解除禁言失败 {target} in {gid}: {e}")
         await event.send(
             MessageChain().message(
-                f"✅ 已解除 QQ {target}{(' (' + (info.get('name') or '') + ')' if info.get('name') else '')} 的永久拉黑"
-                + ("，并取消禁言" if unban_ok else "（如需取消禁言请手动操作）")
+                f"✅ 已解除 QQ {target}{(' (' + name + ')' if name else '')} 的屏蔽"
+                + ("（黑名单）" if removed else "")
+                + ("（临时屏蔽）" if temp_removed else "")
             )
         )
-        logger.info(f"AI守卫: 管理员 {admin} 解除拉黑 {target}")
+        logger.info(f"AI守卫: 管理员 {admin} 解除屏蔽 {target}")
 
-    def _in_blacklist(self, qq: str | None) -> bool:
-        return bool(qq) and str(qq) in self._blacklist
+    def _ban_status(self, qq: str | None) -> str | None:
+        """查询屏蔽状态：'perma' 永久黑名单 / 'temp' 临时屏蔽中 / None。
+
+        临时屏蔽到期自动解除（惰性清理）。"""
+        if not qq:
+            return None
+        qq = str(qq)
+        if qq in self._blacklist:
+            return "perma"
+        until = self._temp_ban.get(qq)
+        if until:
+            if time.time() < until:
+                return "temp"
+            # 到期：自动解除
+            del self._temp_ban[qq]
+        return None
 
     def _blacklist_add(
         self, qq: str, name: str = "", reason: str = "",
@@ -1021,7 +1126,7 @@ class Main(Star):
         # 黑名单强制拦截：无论是否提及，黑名单用户一律不允许与 AI 对话
         event.stop_event()
         if event.get_group_id():
-            # 群聊：静默忽略——不回复、不提示、不重复禁言/上报
+            # 群聊：静默忽略——不回复、不提示、不重复上报
             logger.info(f"AI守卫: 黑名单用户 {qq} 群聊消息已静默忽略")
             return
         # 私聊：删除好友（删了自然发不进来）
@@ -1062,24 +1167,6 @@ class Main(Star):
                 if name:
                     return str(name)
         return ""
-
-    async def _apply_ban(
-        self, event: AstrMessageEvent, target: str, group_id: str | None, minutes: int
-    ) -> bool:
-        """执行禁言。成功返回 True。"""
-        if not group_id:
-            return False
-        try:
-            await event.bot.call_action(
-                "set_group_ban",
-                group_id=int(group_id),
-                user_id=int(target),
-                duration=minutes * 60,
-            )
-            return True
-        except BaseException as e:
-            logger.error(f"AI守卫: 禁言 {target} 失败: {e}")
-            return False
 
     def _load_blacklist(self) -> None:
         try:
@@ -1350,6 +1437,10 @@ class Main(Star):
         ignore_cd = int(self.config.get("confirm_timeout_minutes", 10) or 10) * 60
         for k in [k for k, v in self._ignored.items() if now - v > ignore_cd * 2]:
             del self._ignored[k]
+        # 清理过期的临时屏蔽（AI 层到期自动解除）
+        for k in [k for k, until in self._temp_ban.items() if now >= until]:
+            logger.info(f"AI守卫: 临时屏蔽到期自动解除 {k}")
+            del self._temp_ban[k]
 
     def _source_label(self, event: AstrMessageEvent) -> str:
         try:
@@ -1426,7 +1517,7 @@ class Main(Star):
             + (f"\n🧠 注入: {result.get('injection_type', '')}" if injection else "")
             + f"\n攻击者: QQ {attacker or '未知'}"
             + f"\n理由: {result.get('reason', '')}"
-            + f"\n（已执行上报流程）"
+            + "\n（已执行上报流程）"
         )
 
     @filter.command("守卫状态")
@@ -1439,7 +1530,7 @@ class Main(Star):
             f"灵敏度: {self.config.get('sensitivity', 0.5)}"
             f"{'（重点关注名单生效）' if self._is_focus(key) else ''}\n"
             f"监听会话数: {len(self._history)} | 冷却中: {len(self._cooldown)}\n"
-            f"待确认拉黑: {len(self._pending)} | 已忽略事件: {len(self._ignored)}\n"
+            f"待确认屏蔽: {len(self._pending)} | 已忽略事件: {len(self._ignored)}\n"
             f"📊 统计: LLM调用 {self._stats['llm_calls']} | 上报 {self._stats['reports']} | 注入 {self._stats['injections']}\n"
             f"跳过对话: {'开' if bool(self.config.get('skip_reply_enabled', True)) else '关'}\n"
             f"黑名单: {len(self._blacklist)} 人\n"
